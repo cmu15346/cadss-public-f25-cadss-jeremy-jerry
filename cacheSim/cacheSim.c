@@ -14,7 +14,6 @@ typedef struct _pendingRequest {
     int64_t addr;
     int processorNum;
     void (*callback)(int, int64_t);
-    struct _pendingRequest* next;
     trace_op* op;
 } pendingRequest;
 
@@ -50,11 +49,11 @@ bool useVictim = false;
 bool useRRIP = false;
 unsigned long accessCounter = 0;
 
-int getSet(uint64_t addr) {
+uint64_t getSet(uint64_t addr) {
     return (addr >> b) & ~(~0L << s);
 }
 
-int getTag(uint64_t addr) {
+uint64_t getTag(uint64_t addr) {
     return (addr >> (b + s)) & ~(~0L << (64 - (b + s)));
 }
 
@@ -145,74 +144,17 @@ cache* init(cache_sim_args* csa)
 // This routine is a linkage to the rest of the memory hierarchy
 void coherCallback(int type, int processorNum, int64_t addr)
 {
+    pendingRequest* pr = NULL;
     switch (type)
     {
         case NO_ACTION:
-            if (pendPermReq->processorNum == processorNum && pendPermReq->addr == addr)
-            {
-                pendingRequest* pr = pendPermReq;
-                pendPermReq = pendPermReq->next;
-                pr->next = readyPermReq;
-                readyPermReq = pr; 
-            }
-            else
-            {
-                pendingRequest* prevReq = pendPermReq;
-                pendingRequest* pr = pendPermReq->next;
-
-                while (pr != NULL)
-                {
-                    if (pr->processorNum == processorNum && pr->addr == addr)
-                    {
-                        prevReq = pr->next;
-                        pr->next = readyPermReq;
-                        readyPermReq = pr; 
-                        break;
-                    }
-                    pr = pr->next;
-                    prevReq = prevReq->next;
-                }
-            }
+            //assume only one pending eviction at a time
+            pr = pendPermReq;
+            readyPermReq = pr; 
             break;
         case DATA_RECV:
-            if (pendReq->processorNum == processorNum && pendReq->addr == addr)
-            {
-                pendingRequest* pr = pendReq;
-                pendReq = pendReq->next;
-
-                pr->next = readyReq;
-                readyReq = pr;
-            }
-            else
-            {
-                pendingRequest* prevReq = pendReq;
-                pendingRequest* pr = pendReq->next;
-
-                while (pr != NULL)
-                {
-                    if (pr->processorNum == processorNum && pr->addr == addr)
-                    {
-                        prevReq->next = pr->next;
-
-                        pr->next = readyReq;
-                        readyReq = pr;
-                        break;
-                    }
-                    pr = pr->next;
-                    prevReq = prevReq->next;
-                }
-
-                if (pr == NULL && CADSS_VERBOSE == 1)
-                {
-                    pr = pendReq;
-                    while (pr != NULL)
-                    {
-                        printf("W: %p (%lx %d)\t", pr, pr->addr, pr->processorNum);
-                        pr = pr->next;
-                    }
-                }
-                assert(pr != NULL);
-            }
+            pr = pendReq;
+            readyReq = pr;
             break;
 
         case INVALIDATE:
@@ -229,7 +171,7 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
 {
     assert(op != NULL);
     assert(callback != NULL);
-    uint64_t addr = (op->memAddress & ~(blockSize - 1));
+    uint64_t addr = op->memAddress;
 
     // Simple model to only have one outstanding memory operation
 
@@ -253,7 +195,6 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
             else {
                 set[i]->timeStamp = accessCounter;
             }
-            pr->next = readyReq;
             readyReq = pr;
             accessCounter++;
             return;
@@ -278,12 +219,10 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
             accessCounter++;
             if (perm == 1)
             {
-                pr->next = readyReq;
                 readyReq = pr;
             }
             else
             {
-                pr->next = pendReq;
                 pendReq = pr;
             }
             return;
@@ -317,6 +256,17 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
         }
     }
 
+    // Tell memory about this request
+    // TODO: only do this if this is a miss
+    // TODO: evictions will also need a call to memory with
+    uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
+    if (invl == 1){
+        pendPermReq = pr;
+    }
+    else{
+        readyPermReq = pr;
+    }
+
     set[victimIndex]->tag = cacheTag;
     set[victimIndex]->tag = cacheTag;
     set[victimIndex]->dirty = (op->op == MEM_STORE);
@@ -329,51 +279,34 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
         set[victimIndex]->timeStamp = accessCounter;
     }
 
-    // Tell memory about this request
-    // TODO: only do this if this is a miss
-    // TODO: evictions will also need a call to memory with
-    uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
-    if (invl == 1){
-        pr->next = pendPermReq;
-        pendPermReq = pr;
-    }
-    else{
-        pr->next = readyPermReq;
-        readyPermReq = pr;
-    }
     accessCounter++;
 }
 
 int tick()
 {
     // Advance ticks in the coherence component.
-    printf("Tick\n");
     coherComp->si.tick();
     pendingRequest* pr = readyPermReq;
-    while (pr != NULL)
+    if (pr != NULL)
     {
         trace_op* op = pr->op;
         uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), op->memAddress, pr->processorNum);
         if (perm == 1)
         {
-            pr->next = readyReq;
             readyReq = pr;
         }
         else
         {
-            pr->next = pendReq;
             pendReq = pr;
         }  
-        pr = pr->next;
     }
     readyPermReq = NULL;
 
     pr = readyReq;
-    while (pr != NULL)
+    if (pr != NULL)
     {
         pendingRequest* t = pr;
         pr->callback(pr->processorNum, pr->tag);
-        pr = pr->next;
         free(t);
     }
     readyReq = NULL;
