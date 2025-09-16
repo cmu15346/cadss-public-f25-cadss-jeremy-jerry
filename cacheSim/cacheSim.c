@@ -34,6 +34,7 @@ typedef struct _cacheLine {
 cache* self = NULL;
 coher* coherComp = NULL;
 cacheLine*** cacheSets = NULL;
+cacheLine** victimCache = NULL;
 
 int processorCount = 1;
 int CADSS_VERBOSE = 0;
@@ -48,6 +49,7 @@ int rripBits = 0;
 bool useVictim = false;
 bool useRRIP = false;
 unsigned long accessCounter = 0;
+unsigned long victimCounter = 0;
 
 uint64_t getSet(uint64_t addr) {
     return (addr >> b) & ~(~0L << s);
@@ -55,6 +57,10 @@ uint64_t getSet(uint64_t addr) {
 
 uint64_t getTag(uint64_t addr) {
     return (addr >> (b + s)) & ~(~0L << (64 - (b + s)));
+}
+
+uint64_t getVictimTag(uint64_t addr) {
+    return (addr >> b) & ~(~0L << (64 - b));
 }
 
 void memoryRequest(trace_op* op, int processorNum, int64_t tag,
@@ -137,6 +143,12 @@ cache* init(cache_sim_args* csa)
     coherComp->registerCacheInterface(coherCallback);
 
     createCache(sets, lines);
+    if (useVictim) {
+        victimCache = (cacheLine**)malloc(sizeof(cacheLine*) * victimEntries);
+        for (int i = 0; i < victimEntries; i++) {
+            victimCache[i] = (cacheLine*)calloc(sizeof(cacheLine), 1);
+        }
+    }
 
     return self;
 }
@@ -164,6 +176,72 @@ void coherCallback(int type, int processorNum, int64_t addr)
         default:
             break;
     }  
+}
+
+cacheLine *findInVictimCache(uint64_t addr) {
+    unsigned long tag = getVictimTag(addr);
+    for (int i = 0; i < victimEntries; i++) {
+        if (victimCache[i]->valid && victimCache[i]->tag == tag) {
+            victimCache[i]->valid = false;
+            return victimCache[i];
+        }
+    }
+    return NULL;
+}
+
+void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
+    unsigned long tag = getVictimTag(line->addr);
+    int evictIndex = -1;
+    for (int i = 0; i < victimEntries; i++) {
+        if (!victimCache[i]->valid) {
+            victimCache[i]->tag = tag;
+            victimCache[i]->valid = true;
+            victimCache[i]->addr = line->addr;
+            victimCache[i]->processorNum = line->processorNum;
+            victimCache[i]->dirty = line->dirty;
+            victimCache[i]->timeStamp = victimCounter;
+            victimCounter++;
+            if (!isSwap){
+                uint8_t perm = coherComp->permReq((pr->op->op == MEM_LOAD), pr->op->memAddress, pr->processorNum);
+                if (perm == 1)
+                {
+                    readyReq = pr;
+                }
+                else
+                {
+                    pendReq = pr;
+                }
+            }
+            return;
+        }
+        else {
+            if (evictIndex == -1) {
+                evictIndex = i;
+            }
+            else {
+                if (victimCache[i]->timeStamp < victimCache[evictIndex]->timeStamp) {
+                    evictIndex = i;
+                }
+            }
+        }
+    }
+    assert(!isSwap);
+    //evicted from victim cache
+    uint8_t invl = coherComp->invlReq(victimCache[evictIndex]->addr, victimCache[evictIndex]->processorNum);
+    if (invl == 1){
+        pendPermReq = pr;
+    }
+    else{
+        readyPermReq = pr;
+    }
+
+    victimCache[evictIndex]->tag = tag;
+    victimCache[evictIndex]->valid = true;
+    victimCache[evictIndex]->addr = line->addr;
+    victimCache[evictIndex]->processorNum = line->processorNum;
+    victimCache[evictIndex]->dirty = line->dirty;
+    victimCache[evictIndex]->timeStamp = victimCounter;
+    victimCounter++;
 }
 
 void memoryRequest(trace_op* op, int processorNum, int64_t tag,
@@ -201,9 +279,19 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
         }
     }
     //miss
+    bool foundInVictim = false;
+    if (useVictim) {
+        cacheLine *vLine = findInVictimCache(addr);
+        //guarantees that the victim cache now has space for a new line
+        if (vLine != NULL) {
+            foundInVictim = true;
+            readyReq = pr;
+        }
+    }
     int victimIndex = -1;
     for (int i = 0; i < lines; i++) {
         if (!set[i]->valid) {
+            assert(!foundInVictim);
             set[i]->valid = true;
             set[i]->tag = cacheTag;
             set[i]->dirty = (op->op == MEM_STORE);
@@ -259,15 +347,18 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
     // Tell memory about this request
     // TODO: only do this if this is a miss
     // TODO: evictions will also need a call to memory with
-    uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
-    if (invl == 1){
-        pendPermReq = pr;
+    if (useVictim) {
+        placeInVictimCache(set[victimIndex], pr, foundInVictim);
     }
-    else{
-        readyPermReq = pr;
-    }
-
-    set[victimIndex]->tag = cacheTag;
+    else { 
+        uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
+        if (invl == 1){
+            pendPermReq = pr;
+        }
+        else{
+            readyPermReq = pr;
+        }
+    } 
     set[victimIndex]->tag = cacheTag;
     set[victimIndex]->dirty = (op->op == MEM_STORE);
     set[victimIndex]->addr = addr;
