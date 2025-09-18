@@ -15,6 +15,7 @@ typedef struct _pendingRequest {
     int processorNum;
     void (*callback)(int, int64_t);
     trace_op* op;
+    struct _pendingRequest* next;
 } pendingRequest;
 
 pendingRequest* readyReq = NULL;
@@ -160,12 +161,15 @@ void coherCallback(int type, int processorNum, int64_t addr)
     switch (type)
     {
         case NO_ACTION:
-            //assume only one pending eviction at a time
             pr = pendPermReq;
+            pendPermReq = pr->next;
+            pr->next = readyPermReq;
             readyPermReq = pr; 
             break;
         case DATA_RECV:
             pr = pendReq;
+            pendReq = pr->next;
+            pr->next = readyReq;
             readyReq = pr;
             break;
 
@@ -202,13 +206,15 @@ void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
             victimCache[i]->timeStamp = victimCounter;
             victimCounter++;
             if (!isSwap){
-                uint8_t perm = coherComp->permReq((pr->op->op == MEM_LOAD), pr->op->memAddress, pr->processorNum);
+                uint8_t perm = coherComp->permReq((pr->op->op == MEM_LOAD), pr->addr, pr->processorNum);
                 if (perm == 1)
                 {
+                    pr->next = readyReq;
                     readyReq = pr;
                 }
                 else
                 {
+                    pr->next = pendReq;
                     pendReq = pr;
                 }
             }
@@ -229,9 +235,11 @@ void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     //evicted from victim cache
     uint8_t invl = coherComp->invlReq(victimCache[evictIndex]->addr, victimCache[evictIndex]->processorNum);
     if (invl == 1){
+        pr->next = pendPermReq;
         pendPermReq = pr;
     }
     else{
+        pr->next = readyPermReq;
         readyPermReq = pr;
     }
 
@@ -244,15 +252,9 @@ void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     victimCounter++;
 }
 
-void memoryRequest(trace_op* op, int processorNum, int64_t tag,
-                   void (*callback)(int, int64_t))
+void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
+                   void (*callback)(int, int64_t)) 
 {
-    assert(op != NULL);
-    assert(callback != NULL);
-    uint64_t addr = op->memAddress;
-
-    // Simple model to only have one outstanding memory operation
-
     pendingRequest* pr = malloc(sizeof(pendingRequest));
     pr->tag = tag;
     pr->addr = addr;
@@ -273,6 +275,7 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
             else {
                 set[i]->timeStamp = accessCounter;
             }
+            pr->next = readyReq;
             readyReq = pr;
             accessCounter++;
             return;
@@ -285,6 +288,7 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
         //guarantees that the victim cache now has space for a new line
         if (vLine != NULL) {
             foundInVictim = true;
+            pr->next = readyReq;
             readyReq = pr;
         }
     }
@@ -303,14 +307,16 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
             else {
                 set[i]->timeStamp = accessCounter;
             }
-            uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), op->memAddress, processorNum);
+            uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), addr, processorNum);
             accessCounter++;
             if (perm == 1)
             {
+                pr->next = readyReq;
                 readyReq = pr;
             }
             else
             {
+                pr->next = pendReq;
                 pendReq = pr;
             }
             return;
@@ -353,9 +359,11 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
     else { 
         uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
         if (invl == 1){
+            pr->next = pendPermReq;
             pendPermReq = pr;
         }
         else{
+            pr->next = readyPermReq;
             readyPermReq = pr;
         }
     } 
@@ -373,34 +381,56 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
     accessCounter++;
 }
 
+void memoryRequest(trace_op* op, int processorNum, int64_t tag,
+                   void (*callback)(int, int64_t))
+{
+    assert(op != NULL);
+    assert(callback != NULL);
+    uint64_t addr = op->memAddress;
+    uint64_t mask = (uint64_t)(blockSize - 1);
+    if (addr & mask) {
+        uint64_t addr1 = addr & (~mask);
+        uint64_t addr2 = addr1 + (uint64_t)blockSize;
+        cacheRequest(op, addr1, processorNum, tag, callback);
+        cacheRequest(op, addr2, processorNum, tag, callback);
+    }
+    else {
+        cacheRequest(op, addr, processorNum, tag, callback);
+    }
+}
+
 int tick()
 {
     // Advance ticks in the coherence component.
     coherComp->si.tick();
     pendingRequest* pr = readyPermReq;
-    if (pr != NULL)
+    while (pr != NULL)
     {
         trace_op* op = pr->op;
-        uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), op->memAddress, pr->processorNum);
+        uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), pr->addr, pr->processorNum);
         if (perm == 1)
         {
+            pr->next = readyReq;
             readyReq = pr;
         }
         else
         {
+            pr->next = pendReq;
             pendReq = pr;
-        }  
+        }
+        readyPermReq = readyPermReq->next;  
+        pr = readyPermReq;
     }
-    readyPermReq = NULL;
 
     pr = readyReq;
-    if (pr != NULL)
+    while (pr != NULL)
     {
         pendingRequest* t = pr;
+        readyReq = readyReq->next;
         pr->callback(pr->processorNum, pr->tag);
         free(t);
+        pr = readyReq;
     }
-    readyReq = NULL;
 
     return 1;
 }
