@@ -427,7 +427,9 @@ int tick()
     {
         pendingRequest* t = pr;
         readyReq = readyReq->next;
-        pr->callback(pr->processorNum, pr->tag);
+        if (readyReq == NULL && pendReq == NULL && readyPermReq == NULL && pendPermReq == NULL) {
+            pr->callback(pr->processorNum, pr->tag);
+        }
         free(t);
         pr = readyReq;
     }
