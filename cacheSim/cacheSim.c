@@ -11,16 +11,11 @@
 
 typedef struct _pendingRequest {
     int64_t tag;
-    int64_t addr1;
-    int64_t addr2;
+    int64_t addr;
+    int processorNum;
     void (*callback)(int, int64_t);
     trace_op* op;
     struct _pendingRequest* next;
-    int processorNum;
-    bool ready1;
-    bool ready2;
-    bool readyPerm1;
-    bool readyPerm2;
 } pendingRequest;
 
 pendingRequest* readyReq = NULL;
@@ -167,29 +162,15 @@ void coherCallback(int type, int processorNum, int64_t addr)
     {
         case NO_ACTION:
             pr = pendPermReq;
-            if (pr->addr1 == addr) {
-                pr->readyPerm1 = true;
-            }
-            else if (pr->addr2 == addr) {
-                pr->readyPerm2 = true;
-            }
-            if (pr->readyPerm1 && pr->readyPerm2) {
-                readyPermReq = pr;
-                pendPermReq = pr->next;
-            }
+            pendPermReq = pr->next;
+            pr->next = readyPermReq;
+            readyPermReq = pr; 
             break;
         case DATA_RECV:
             pr = pendReq;
-            if (pr->addr1 == addr) {
-                pr->ready1 = true;
-            }
-            else if (pr->addr2 == addr) {
-                pr->ready2 = true;
-            }
-            if (pr->ready1 && pr->ready2) {
-                readyReq = pr;
-                pendReq = pr->next;
-            }
+            pendReq = pr->next;
+            pr->next = readyReq;
+            readyReq = pr;
             break;
 
         case INVALIDATE:
@@ -212,7 +193,7 @@ cacheLine *findInVictimCache(uint64_t addr) {
     return NULL;
 }
 
-int placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
+void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     unsigned long tag = getVictimTag(line->addr);
     int evictIndex = -1;
     for (int i = 0; i < victimEntries; i++) {
@@ -224,7 +205,20 @@ int placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
             victimCache[i]->dirty = line->dirty;
             victimCache[i]->timeStamp = victimCounter;
             victimCounter++;
-            return -1;
+            if (!isSwap){
+                uint8_t perm = coherComp->permReq((pr->op->op == MEM_LOAD), pr->addr, pr->processorNum);
+                if (perm == 1)
+                {
+                    pr->next = readyReq;
+                    readyReq = pr;
+                }
+                else
+                {
+                    pr->next = pendReq;
+                    pendReq = pr;
+                }
+            }
+            return;
         }
         else {
             if (evictIndex == -1) {
@@ -240,6 +234,14 @@ int placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     assert(!isSwap);
     //evicted from victim cache
     uint8_t invl = coherComp->invlReq(victimCache[evictIndex]->addr, victimCache[evictIndex]->processorNum);
+    if (invl == 1){
+        pr->next = pendPermReq;
+        pendPermReq = pr;
+    }
+    else{
+        pr->next = readyPermReq;
+        readyPermReq = pr;
+    }
 
     victimCache[evictIndex]->tag = tag;
     victimCache[evictIndex]->valid = true;
@@ -248,10 +250,20 @@ int placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     victimCache[evictIndex]->dirty = line->dirty;
     victimCache[evictIndex]->timeStamp = victimCounter;
     victimCounter++;
-    return invl;
 }
 
-bool lookUp(uint64_t addr, trace_op* op, unsigned long cacheTag, cacheLine **set) {
+void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
+                   void (*callback)(int, int64_t)) 
+{
+    pendingRequest* pr = malloc(sizeof(pendingRequest));
+    pr->tag = tag;
+    pr->addr = addr;
+    pr->callback = callback;
+    pr->processorNum = processorNum;
+    pr->op = op;
+
+    unsigned long cacheTag = getTag(addr);
+    cacheLine **set = cacheSets[getSet(addr)];
     for (int i = 0; i < lines; i++) {
         if (set[i]->valid && set[i]->tag == cacheTag) {
             if (op->op == MEM_STORE) {
@@ -263,17 +275,53 @@ bool lookUp(uint64_t addr, trace_op* op, unsigned long cacheTag, cacheLine **set
             else {
                 set[i]->timeStamp = accessCounter;
             }
+            pr->next = readyReq;
+            readyReq = pr;
             accessCounter++;
-            return true;
+            return;
         }
     }
-    return false;
-}
-
-int selectForEviction(cacheLine **set) {
+    //miss
+    bool foundInVictim = false;
+    if (useVictim) {
+        cacheLine *vLine = findInVictimCache(addr);
+        //guarantees that the victim cache now has space for a new line
+        if (vLine != NULL) {
+            foundInVictim = true;
+            pr->next = readyReq;
+            readyReq = pr;
+        }
+    }
     int victimIndex = -1;
     for (int i = 0; i < lines; i++) {
-        if (set[i]->valid) {
+        if (!set[i]->valid) {
+            assert(!foundInVictim);
+            set[i]->valid = true;
+            set[i]->tag = cacheTag;
+            set[i]->dirty = (op->op == MEM_STORE);
+            set[i]->addr = addr;
+            set[i]->processorNum = processorNum;
+            if (useRRIP) {
+                set[i]->timeStamp = (1 << rripBits) - 2;
+            }
+            else {
+                set[i]->timeStamp = accessCounter;
+            }
+            uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), addr, processorNum);
+            accessCounter++;
+            if (perm == 1)
+            {
+                pr->next = readyReq;
+                readyReq = pr;
+            }
+            else
+            {
+                pr->next = pendReq;
+                pendReq = pr;
+            }
+            return;
+        }
+        else {
             if (victimIndex == -1) {
                 victimIndex = i;
             }
@@ -290,200 +338,47 @@ int selectForEviction(cacheLine **set) {
                 }
             }
         }
-        else {
-            return i;
+    }
+    //eviction
+    if (useRRIP) {
+        //increment all timestamps
+        if (set[victimIndex]->timeStamp < (1 << rripBits) - 1) {
+            unsigned long diff = (1 << rripBits) - 1 - set[victimIndex]->timeStamp;
+            for (int i = 0; i < lines; i++) {
+                set[i]->timeStamp += diff;
+            }
         }
     }
-    return victimIndex;
-}
 
-pendingRequest *cacheRequest (trace_op* op, uint64_t addr1, uint64_t addr2, int processorNum, int64_t tag,
-                   void (*callback)(int, int64_t)) 
-{
-    bool multiBlock = (addr2 != 0);
-    pendingRequest* pr = malloc(sizeof(pendingRequest));
-    pr->tag = tag;
-    pr->addr1 = addr1;
-    if (multiBlock) {
-        pr->addr2 = addr2;
-    }
-    pr->callback = callback;
-    pr->processorNum = processorNum;
-    pr->op = op;
-
-    pr->ready1 = false;
-    pr->ready2 = true;
-    unsigned long cacheTag1 = getTag(addr1);
-    cacheLine **set1 = cacheSets[getSet(addr1)];
-    unsigned long cacheTag2;
-    cacheLine **set2;
-    if (multiBlock) {
-        cacheTag2 = getTag(addr2);
-        set2 = cacheSets[getSet(addr2)];
-        pr->ready2 = false;
-    }
-    pr->ready1 = lookUp(addr1, op, cacheTag1, set1);
-    if (multiBlock) {
-        pr->ready2 = lookUp(addr2, op, cacheTag2, set2);
-    }
-    if (pr->ready1 && pr->ready2) {
-        pr->next = readyReq;
-        readyReq = pr;
-        return pr;
-    }
-
-    //miss
-    bool foundInVictim1 = false;
-    bool foundInVictim2 = true;
-    if (multiBlock) {
-        foundInVictim2 = false;
-    }
+    // Tell memory about this request
+    // TODO: only do this if this is a miss
+    // TODO: evictions will also need a call to memory with
     if (useVictim) {
-        if (!pr->ready1) {
-            cacheLine *vLine = findInVictimCache(addr1);
-            //guarantees that the victim cache now has space for a new line
-            if (vLine != NULL) {
-                foundInVictim1 = true;
-                pr->ready1 = true;
-            }
-        }
-        if (multiBlock && !pr->ready2) {
-            cacheLine *vLine = findInVictimCache(addr2);
-            //guarantees that the victim cache now has space for a new line
-            if (vLine != NULL) {
-                foundInVictim2 = true;
-                pr->ready2 = true;
-            }
-        }
+        placeInVictimCache(set[victimIndex], pr, foundInVictim);
     }
-
-    int victimIndex1 = -1;
-    int victimIndex2 = -1;
-    int invl1 = -1;
-    int invl2 = -1;
-    if (!pr->ready1) {
-        victimIndex1 = selectForEviction(set1);
-        if (!set1[victimIndex1]->valid) {
-            assert(!foundInVictim1);
-            set1[victimIndex1]->valid = true;
-            set1[victimIndex1]->tag = cacheTag1;
-            set1[victimIndex1]->dirty = (op->op == MEM_STORE);
-            set1[victimIndex1]->addr = addr1;
-            set1[victimIndex1]->processorNum = processorNum;
-            if (useRRIP) {
-                set1[victimIndex1]->timeStamp = (1 << rripBits) - 2;
-            }
-            else {
-                set1[victimIndex1]->timeStamp = accessCounter;
-            }
-            uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), addr1, processorNum);
-            accessCounter++;
-            if (perm == 1)
-            {
-                pr->ready1 = true;
-            }
+    else { 
+        uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
+        if (invl == 1){
+            pr->next = pendPermReq;
+            pendPermReq = pr;
         }
-        else {
-            if (useVictim) {
-                invl1 = placeInVictimCache(set1[victimIndex1], pr, foundInVictim1);
-            }
-            else {
-                invl1 = coherComp->invlReq(set1[victimIndex1]->addr, set1[victimIndex1]->processorNum);
-            }
+        else{
+            pr->next = readyPermReq;
+            readyPermReq = pr;
         }
-        if (useRRIP) {
-            //increment all timestamps
-            if (set1[victimIndex1]->timeStamp < (1 << rripBits) - 1) {
-                unsigned long diff = (1 << rripBits) - 1 - set1[victimIndex1]->timeStamp;
-                for (int i = 0; i < lines; i++) {
-                    set1[i]->timeStamp += diff;
-                }
-            }
-        }
-    }
-    if (multiBlock && !pr->ready2) {
-        victimIndex2 = selectForEviction(set2);
-        if (!set2[victimIndex2]->valid) {
-            assert(!foundInVictim2);
-            set1[victimIndex2]->valid = true;
-            set1[victimIndex2]->tag = cacheTag2;
-            set1[victimIndex2]->dirty = (op->op == MEM_STORE);
-            set1[victimIndex2]->addr = addr2;
-            set1[victimIndex2]->processorNum = processorNum;
-            if (useRRIP) {
-                set1[victimIndex2]->timeStamp = (1 << rripBits) - 2;
-            }
-            else {
-                set1[victimIndex2]->timeStamp = accessCounter;
-            }
-            uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), addr2, processorNum);
-            accessCounter++;
-            if (perm == 1)
-            {
-                pr->ready2 = true;
-            }
-        }
-        else {
-            if (useVictim) {
-                invl2 = placeInVictimCache(set2[victimIndex2], pr, foundInVictim2);
-            }
-            else {
-                invl2 = coherComp->invlReq(set2[victimIndex2]->addr, set2[victimIndex2]->processorNum);
-            }
-        }
-        if (useRRIP) {
-            //increment all timestamps
-            if (set2[victimIndex2]->timeStamp < (1 << rripBits) - 1) {
-                unsigned long diff = (1 << rripBits) - 1 - set2[victimIndex2]->timeStamp;
-                for (int i = 0; i < lines; i++) {
-                    set2[i]->timeStamp += diff;
-                }
-            }
-        }
-    }
-
-    if (pr->ready1 && pr->ready2) {
-        pr->next = readyReq;
-        readyReq = pr;
-    }
-    else if (invl1 == 1 || invl2 == 1) {
-        pr->next = pendPermReq;
-        pendPermReq = pr; 
-        pr->readyPerm1 = !invl1;
-        pr->readyPerm2 = !invl2;
+    } 
+    set[victimIndex]->tag = cacheTag;
+    set[victimIndex]->dirty = (op->op == MEM_STORE);
+    set[victimIndex]->addr = addr;
+    set[victimIndex]->processorNum = processorNum;
+    if (useRRIP) {
+        set[victimIndex]->timeStamp = (1 << rripBits) - 2;
     }
     else {
-        pr->next = pendReq;
-        pendReq = pr;
-    }
-    
-    if (victimIndex1 != -1) {
-        set1[victimIndex1]->tag = cacheTag1;
-        set1[victimIndex1]->dirty = (op->op == MEM_STORE);
-        set1[victimIndex1]->addr = addr1;
-        set1[victimIndex1]->processorNum = processorNum;
-        if (useRRIP) {
-            set1[victimIndex1]->timeStamp = (1 << rripBits) - 2;
-        }
-        else {
-            set1[victimIndex1]->timeStamp = accessCounter;
-        }
-    }
-    if (multiBlock && victimIndex2 != -1) {
-        set2[victimIndex2]->tag = cacheTag2;
-        set2[victimIndex2]->dirty = (op->op == MEM_STORE);
-        set2[victimIndex2]->addr = addr2;
-        set2[victimIndex2]->processorNum = processorNum;
-        if (useRRIP) {
-            set2[victimIndex2]->timeStamp = (1 << rripBits) - 2;
-        }
-        else {
-            set2[victimIndex2]->timeStamp = accessCounter;
-        }
+        set[victimIndex]->timeStamp = accessCounter;
     }
 
     accessCounter++;
-    return pr;
 }
 
 void memoryRequest(trace_op* op, int processorNum, int64_t tag,
@@ -496,11 +391,11 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
     if (addr & mask) {
         uint64_t addr1 = addr & (~mask);
         uint64_t addr2 = addr1 + (uint64_t)blockSize;
-        pendingRequest *pr1 = cacheRequest(op, addr1, addr2, processorNum, tag, callback);
-        pendingRequest *pr2 = cacheRequest(op, addr2, addr2, processorNum, tag, callback);
+        cacheRequest(op, addr1, processorNum, tag, callback);
+        cacheRequest(op, addr2, processorNum, tag, callback);
     }
     else {
-        pendingRequest *pr1 = cacheRequest(op, addr, 0, processorNum, tag, callback);
+        cacheRequest(op, addr, processorNum, tag, callback);
     }
 }
 
@@ -512,21 +407,8 @@ int tick()
     while (pr != NULL)
     {
         trace_op* op = pr->op;
-        bool multiBlock = (pr->addr2 != 0);
-        if (!pr->ready1) {
-            uint8_t perm1 = coherComp->permReq((op->op == MEM_LOAD), pr->addr1, pr->processorNum);
-            if (perm1 == 1) {
-                pr->ready1 = true;
-            }
-        }
-        if (multiBlock && !pr->ready2) {
-            uint8_t perm2 = coherComp->permReq((op->op == MEM_LOAD), pr->addr2, pr->processorNum);
-            if (perm2 == 1) {
-                pr->ready2 = true;
-            }
-        }
-        
-        if (pr->ready1 && pr->ready2)
+        uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), pr->addr, pr->processorNum);
+        if (perm == 1)
         {
             pr->next = readyReq;
             readyReq = pr;
