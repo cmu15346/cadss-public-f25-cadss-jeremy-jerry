@@ -12,6 +12,7 @@
 typedef struct _pendingRequest {
     int64_t tag;
     int64_t addr;
+    int64_t evictedAddr;
     int processorNum;
     void (*callback)(int, int64_t);
     trace_op* op;
@@ -154,23 +155,54 @@ cache* init(cache_sim_args* csa)
     return self;
 }
 
+void print_list(pendingRequest* head) {
+    printf("printing lists\n");
+    pendingRequest* curr = head;
+    while (curr != NULL) {
+        printf("Request tag: %ld, addr: %ld, proc: %d\n", curr->tag, curr->addr, curr->processorNum);
+        curr = curr->next;
+    }
+    printf("end of list\n");
+}
+
 // This routine is a linkage to the rest of the memory hierarchy
 void coherCallback(int type, int processorNum, int64_t addr)
 {
     pendingRequest* pr = NULL;
+    // print_list(pendPermReq);
+    // print_list(readyPermReq);
+    // printf("Coherence callback of type %d for processor %d at address %lu\n", type, processorNum, addr);
     switch (type)
     {
         case NO_ACTION:
             pr = pendPermReq;
-            pendPermReq = pr->next;
-            pr->next = readyPermReq;
-            readyPermReq = pr; 
+            if (pr->evictedAddr == addr && pr->processorNum == processorNum) {
+                pendPermReq = pr->next;
+                pr->next = readyPermReq;
+                readyPermReq = pr;
+            }
+            else{
+                pr = pr->next;
+                assert(pr->evictedAddr == addr);
+                pendPermReq->next = pr->next;
+                pr->next = readyPermReq;
+                readyPermReq = pr;
+            }
             break;
         case DATA_RECV:
             pr = pendReq;
-            pendReq = pr->next;
-            pr->next = readyReq;
-            readyReq = pr;
+            if (pr->addr == addr && pr->processorNum == processorNum) {
+                pendReq = pr->next;
+                pr->next = readyReq;
+                readyReq = pr;
+            }
+            else{
+                pr = pr->next;
+                assert(pr->addr == addr);
+                pendReq->next = pr->next;
+                pr->next = readyReq;
+                readyReq = pr;
+            }
             break;
 
         case INVALIDATE:
@@ -234,9 +266,12 @@ void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     assert(!isSwap);
     //evicted from victim cache
     uint8_t invl = coherComp->invlReq(victimCache[evictIndex]->addr, victimCache[evictIndex]->processorNum);
+    pr->evictedAddr = victimCache[evictIndex]->addr;
     if (invl == 1){
+        //printf("invl req pending for addr %lu\n", victimCache[evictIndex]->addr);
         pr->next = pendPermReq;
         pendPermReq = pr;
+        //print_list(pendPermReq);
     }
     else{
         pr->next = readyPermReq;
@@ -261,6 +296,7 @@ void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
     pr->callback = callback;
     pr->processorNum = processorNum;
     pr->op = op;
+    pr->evictedAddr = 0;
 
     unsigned long cacheTag = getTag(addr);
     cacheLine **set = cacheSets[getSet(addr)];
@@ -358,9 +394,12 @@ void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
     }
     else { 
         uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
+        pr->evictedAddr = set[victimIndex]->addr;
         if (invl == 1){
+            //printf("invl req pending for addr %lu\n", set[victimIndex]->addr);
             pr->next = pendPermReq;
             pendPermReq = pr;
+            //print_list(pendPermReq);
         }
         else{
             pr->next = readyPermReq;
@@ -391,10 +430,12 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
     if (addr & mask) {
         uint64_t addr1 = addr & (~mask);
         uint64_t addr2 = addr1 + (uint64_t)blockSize;
+        //printf("Unaligned access at %lu, splitting into %lu and %lu\n", addr, addr1, addr2);
         cacheRequest(op, addr1, processorNum, tag, callback);
         cacheRequest(op, addr2, processorNum, tag, callback);
     }
     else {
+        //printf("Aligned access at %lu\n", addr);
         cacheRequest(op, addr, processorNum, tag, callback);
     }
 }
