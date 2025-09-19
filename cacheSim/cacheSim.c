@@ -440,13 +440,28 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
     }
 }
 
+int countList(pendingRequest* head) {
+    int count = 0;
+    pendingRequest* curr = head;
+    while (curr != NULL) {
+        //printf("Request tag: %ld, addr: %ld, proc: %d\n", curr->tag, curr->addr, curr->processorNum);
+        count++;
+        curr = curr->next;
+    }
+    printf("list has %d requests\n", count);
+    return count;
+}
+
 int tick()
 {
     // Advance ticks in the coherence component.
+    //printf("Tick start with %d requests\n", countLists());
     coherComp->si.tick();
     pendingRequest* pr = readyPermReq;
     while (pr != NULL)
     {
+        //countList(readyPermReq);
+        readyPermReq = readyPermReq->next;
         trace_op* op = pr->op;
         uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), pr->addr, pr->processorNum);
         if (perm == 1)
@@ -458,8 +473,7 @@ int tick()
         {
             pr->next = pendReq;
             pendReq = pr;
-        }
-        readyPermReq = readyPermReq->next;  
+        }  
         pr = readyPermReq;
     }
 
