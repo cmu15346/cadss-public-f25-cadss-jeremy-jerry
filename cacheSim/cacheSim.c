@@ -19,10 +19,10 @@ typedef struct _pendingRequest {
     struct _pendingRequest* next;
 } pendingRequest;
 
-pendingRequest* readyReq = NULL;
-pendingRequest* pendReq = NULL;
-pendingRequest* readyPermReq = NULL;
-pendingRequest* pendPermReq = NULL;
+pendingRequest* readyReq = NULL; // ready for callback
+pendingRequest* pendReq = NULL; // waiting for permReq
+pendingRequest* readyPermReq = NULL; // ready to call permReq after invlReq
+pendingRequest* pendPermReq = NULL; // waiting for invlReq
 
 typedef struct _cacheLine {
     unsigned long tag;
@@ -62,6 +62,7 @@ uint64_t getTag(uint64_t addr) {
 }
 
 uint64_t getVictimTag(uint64_t addr) {
+    //different from normal tag, only removes block offset as victim cache is fully associative
     return (addr >> b) & ~(~0L << (64 - b));
 }
 
@@ -79,6 +80,22 @@ void createCache(int sets, int lines) {
     }
 }
 
+void freeCache() {
+    for (int i = 0; i < sets; i++) {
+        for (int j = 0; j < lines; j++) {
+            free(cacheSets[i][j]);
+        }
+        free(cacheSets[i]);
+    }
+    free(cacheSets);
+    if (useVictim) {
+        for (int i = 0; i < victimEntries; i++) {
+            free(victimCache[i]);
+        }
+        free(victimCache);
+    }
+}
+
 cache* init(cache_sim_args* csa)
 {
     int op;
@@ -88,8 +105,6 @@ cache* init(cache_sim_args* csa)
     int vf = 0;
     int rf = 0;
 
-
-    // TODO - get argument list from assignment
     while ((op = getopt(csa->arg_count, csa->arg_list, "E:s:b:i:R:")) != -1)
     {
         switch (op)
@@ -155,6 +170,10 @@ cache* init(cache_sim_args* csa)
     return self;
 }
 
+/**
+ * brief Print the linked list of pending requests
+ * param head The head of the linked list
+ */
 void print_list(pendingRequest* head) {
     printf("printing lists\n");
     pendingRequest* curr = head;
@@ -169,9 +188,6 @@ void print_list(pendingRequest* head) {
 void coherCallback(int type, int processorNum, int64_t addr)
 {
     pendingRequest* pr = NULL;
-    // print_list(pendPermReq);
-    // print_list(readyPermReq);
-    // printf("Coherence callback of type %d for processor %d at address %lu\n", type, processorNum, addr);
     switch (type)
     {
         case NO_ACTION:
@@ -214,6 +230,11 @@ void coherCallback(int type, int processorNum, int64_t addr)
     }  
 }
 
+/**
+ * brief Search for a tag in the victim cache, invalidates the line if found
+ * param addr The address to search for
+ * return The cache line if found, NULL otherwise
+ */
 cacheLine *findInVictimCache(uint64_t addr) {
     unsigned long tag = getVictimTag(addr);
     for (int i = 0; i < victimEntries; i++) {
@@ -225,6 +246,12 @@ cacheLine *findInVictimCache(uint64_t addr) {
     return NULL;
 }
 
+/**
+ * brief Place a cache line into the victim cache, evicting if necessary
+ * param line The cache line to place into the victim cache
+ * param pr The pending request associated with this operation
+ * param isSwap Whether this is a swap from the main cache or a new eviction
+ */
 void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     unsigned long tag = getVictimTag(line->addr);
     int evictIndex = -1;
@@ -268,10 +295,8 @@ void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     uint8_t invl = coherComp->invlReq(victimCache[evictIndex]->addr, victimCache[evictIndex]->processorNum);
     pr->evictedAddr = victimCache[evictIndex]->addr;
     if (invl == 1){
-        //printf("invl req pending for addr %lu\n", victimCache[evictIndex]->addr);
         pr->next = pendPermReq;
         pendPermReq = pr;
-        //print_list(pendPermReq);
     }
     else{
         pr->next = readyPermReq;
@@ -287,6 +312,14 @@ void placeInVictimCache(cacheLine *line, pendingRequest *pr, bool isSwap) {
     victimCounter++;
 }
 
+/**
+ * brief Handle a cache request, checking for hits/misses and managing evictions
+ * param op The trace operation being performed
+ * param addr The address being accessed(aligned to block size)
+ * param processorNum The processor making the request
+ * param tag A tag to identify the request in the callback
+ * param callback The callback to invoke when the request is complete
+ */
 void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
                    void (*callback)(int, int64_t)) 
 {
@@ -386,9 +419,6 @@ void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
         }
     }
 
-    // Tell memory about this request
-    // TODO: only do this if this is a miss
-    // TODO: evictions will also need a call to memory with
     if (useVictim) {
         placeInVictimCache(set[victimIndex], pr, foundInVictim);
     }
@@ -396,10 +426,8 @@ void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
         uint8_t invl = coherComp->invlReq(set[victimIndex]->addr, set[victimIndex]->processorNum);
         pr->evictedAddr = set[victimIndex]->addr;
         if (invl == 1){
-            //printf("invl req pending for addr %lu\n", set[victimIndex]->addr);
             pr->next = pendPermReq;
             pendPermReq = pr;
-            //print_list(pendPermReq);
         }
         else{
             pr->next = readyPermReq;
@@ -420,31 +448,41 @@ void cacheRequest (trace_op* op, uint64_t addr, int processorNum, int64_t tag,
     accessCounter++;
 }
 
+/**
+ * brief Handle a memory request, splitting if it crosses a block boundary
+ * param op The trace operation being performed
+ * param processorNum The processor making the request
+ * param tag A tag to identify the request in the callback
+ * param callback The callback to invoke when the request is complete
+ */
 void memoryRequest(trace_op* op, int processorNum, int64_t tag,
                    void (*callback)(int, int64_t))
 {
     assert(op != NULL);
     assert(callback != NULL);
+    //Aligns address to block size and checks if it crosses a block boundary
     uint64_t addr = op->memAddress;
     uint64_t mask = (uint64_t)(blockSize - 1);
     if (addr & mask) {
         uint64_t addr1 = addr & (~mask);
         uint64_t addr2 = addr1 + (uint64_t)blockSize;
-        //printf("Unaligned access at %lu, splitting into %lu and %lu\n", addr, addr1, addr2);
         cacheRequest(op, addr1, processorNum, tag, callback);
         cacheRequest(op, addr2, processorNum, tag, callback);
     }
     else {
-        //printf("Aligned access at %lu\n", addr);
         cacheRequest(op, addr, processorNum, tag, callback);
     }
 }
 
+/**
+ * brief Count the number of requests in all lists
+ * return The total number of requests
+ */
 int countList(pendingRequest* head) {
     int count = 0;
     pendingRequest* curr = head;
     while (curr != NULL) {
-        //printf("Request tag: %ld, addr: %ld, proc: %d\n", curr->tag, curr->addr, curr->processorNum);
+        printf("Request tag: %ld, addr: %ld, proc: %d\n", curr->tag, curr->addr, curr->processorNum);
         count++;
         curr = curr->next;
     }
@@ -455,12 +493,10 @@ int countList(pendingRequest* head) {
 int tick()
 {
     // Advance ticks in the coherence component.
-    //printf("Tick start with %d requests\n", countLists());
     coherComp->si.tick();
     pendingRequest* pr = readyPermReq;
     while (pr != NULL)
     {
-        //countList(readyPermReq);
         readyPermReq = readyPermReq->next;
         trace_op* op = pr->op;
         uint8_t perm = coherComp->permReq((op->op == MEM_LOAD), pr->addr, pr->processorNum);
@@ -499,6 +535,7 @@ int finish(int outFd)
 
 int destroy(void)
 {
-    // free any internally allocated memory here
+    freeCache();
+    free(self);
     return 0;
 }
