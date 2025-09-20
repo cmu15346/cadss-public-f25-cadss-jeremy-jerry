@@ -462,14 +462,16 @@ void memoryRequest(trace_op* op, int processorNum, int64_t tag,
     assert(callback != NULL);
     //Aligns address to block size and checks if it crosses a block boundary
     uint64_t addr = op->memAddress;
+    int accessSize = op->size;
     uint64_t mask = (uint64_t)(blockSize - 1);
-    if (addr & mask) {
+    if ((addr & mask) && ((addr & mask) + accessSize > blockSize)) {
         uint64_t addr1 = addr & (~mask);
         uint64_t addr2 = addr1 + (uint64_t)blockSize;
         cacheRequest(op, addr1, processorNum, tag, callback);
         cacheRequest(op, addr2, processorNum, tag, callback);
     }
     else {
+        addr = addr & (~mask);
         cacheRequest(op, addr, processorNum, tag, callback);
     }
 }
