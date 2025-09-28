@@ -35,8 +35,9 @@ counter decrementCounter(counter c) {
     return c - 1;
 }
 
-void addToBHR(uint8_t taken) {
-    BHR = (BHR & ~(1L << b)) | ((uint64_t)taken << b);
+void addToBHR(bool taken) {
+    uint8_t t = (uint8_t)taken;
+    BHR = ((BHR << 1) | t) & ((1L << b) - 1);
 }
 
 void createPredictor(uint8_t type) {
@@ -46,14 +47,39 @@ void createPredictor(uint8_t type) {
             predictor[i] = 1;
         }
     }
+    else if (type == 2) {
+        return;
+    }
 }
 
 void createBTB() {
     BTB = calloc(predictorSize, sizeof(BTBEntry));
 }
 
-uint64_t getPCIndex(uint64_t addr) {
-    return (addr >> 3) & ((1L << s) - 1);
+counter getCounter(uint64_t addr) {
+    uint64_t pcBits = (addr >> 3) & ((1L << s) - 1);
+    if (g == 0) {
+        return predictor[pcBits];
+    }
+    return 0;
+}
+
+void setCounter(uint64_t addr, counter c) {
+    uint64_t pcBits = (addr >> 3) & ((1L << s) - 1);
+    if (g == 0) {
+        predictor[pcBits] = c;
+    }
+    return;
+}
+
+uint64_t getBTB(uint64_t addr) {
+    uint64_t pcBits = (addr >> 3) & ((1L << s) - 1);
+    return BTB[pcBits];
+}
+
+void setBTB(uint64_t addr, uint64_t NextAddr) {
+    uint64_t pcBits = (addr >> 3) & ((1L << s) - 1);
+    BTB[pcBits] = NextAddr;
 }
 
 bool predict(counter c) {
@@ -119,13 +145,12 @@ uint64_t branchRequest(trace_op* op, int processorNum)
     uint64_t pcAddress = op->pcAddress;
     uint64_t nextAddress = op->nextPCAddress; 
     uint64_t predAddress = 0;
-    uint64_t index = getPCIndex(pcAddress);
 
     //predict
-    counter c = predictor[index];
+    counter c = getCounter(pcAddress);
     bool taken = predict(c);
     if (taken) {
-        predAddress = BTB[index];
+        predAddress = getBTB(pcAddress);
     }
     else {
         predAddress = pcAddress + 4;
@@ -134,12 +159,12 @@ uint64_t branchRequest(trace_op* op, int processorNum)
     //update predictor
     if (nextAddress != pcAddress + 4) {
         //branch taken
-        predictor[index] = incrementCounter(c);
-        BTB[index] = nextAddress;
+        setCounter(pcAddress, incrementCounter(c));
+        setBTB(pcAddress, nextAddress);
     }
     else {
         //branch not taken
-        predictor[index] = decrementCounter(c);
+        setCounter(pcAddress, decrementCounter(c));
     }
 
 
