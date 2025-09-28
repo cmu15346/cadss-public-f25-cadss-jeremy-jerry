@@ -4,8 +4,66 @@
 #include <getopt.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
 
 branch* self = NULL;
+uint64_t predictorSize = -1;
+int8_t s = -1;
+uint64_t BHRSize = 0;
+int8_t b = 0;
+int8_t g = 0;
+
+typedef unsigned char counter;
+typedef uint64_t BTBEntry;
+
+counter* predictor;
+BTBEntry* BTB;
+uint64_t BHR = 0;
+
+counter incrementCounter(counter c) {
+    if (c == 3) {
+        return c;
+    }
+    return c + 1;
+}
+
+counter decrementCounter(counter c) {
+    if (c == 0) {
+        return c;
+    }
+    return c - 1;
+}
+
+void addToBHR(uint8_t taken) {
+    BHR = (BHR & ~(1L << b)) | ((uint64_t)taken << b);
+}
+
+void createPredictor(uint8_t type) {
+    if (type == 0){
+        predictor = malloc(predictorSize * sizeof(counter));
+        for (uint64_t i = 0; i < predictorSize; i++) {
+            predictor[i] = 1;
+        }
+    }
+}
+
+void createBTB() {
+    BTB = calloc(predictorSize, sizeof(BTBEntry));
+}
+
+uint64_t getPCIndex(uint64_t addr) {
+    return (addr >> 3) & ((1L << s) - 1);
+}
+
+bool predict(counter c) {
+    if (c == 0 || c == 1) {
+        return false;
+    }
+    else {
+        return true;
+    }
+}
 
 uint64_t branchRequest(trace_op* op, int processorNum);
 
@@ -24,13 +82,20 @@ branch* init(branch_sim_args* csa)
 
                 // predictor size
             case 's':
+                s = atoi(optarg);
+                predictorSize = 1L << s;
                 break;
 
                 // BHR size
             case 'b':
+                b = atoi(optarg);
+                if (b > 0) {
+                    BHRSize = 1L << b;
+                }
                 break;
                 // predictor model
             case 'g':
+                g = atoi(optarg);
                 break;
         }
     }
@@ -40,6 +105,8 @@ branch* init(branch_sim_args* csa)
     self->si.tick = tick;
     self->si.finish = finish;
     self->si.destroy = destroy;
+    createPredictor(g);
+    createBTB();
 
     return self;
 }
@@ -50,7 +117,31 @@ uint64_t branchRequest(trace_op* op, int processorNum)
     assert(op != NULL);
 
     uint64_t pcAddress = op->pcAddress;
-    uint64_t predAddress = op->nextPCAddress; // 100% accuracy
+    uint64_t nextAddress = op->nextPCAddress; 
+    uint64_t predAddress = 0;
+    uint64_t index = getPCIndex(pcAddress);
+
+    //predict
+    counter c = predictor[index];
+    bool taken = predict(c);
+    if (taken) {
+        predAddress = BTB[index];
+    }
+    else {
+        predAddress = pcAddress + 4;
+    }
+
+    //update predictor
+    if (nextAddress != pcAddress + 4) {
+        //branch taken
+        predictor[index] = incrementCounter(c);
+        BTB[index] = nextAddress;
+    }
+    else {
+        //branch not taken
+        predictor[index] = decrementCounter(c);
+    }
+
 
     // In student's simulator, either return a predicted address from BTB
     //   or pcAddress + 4 as a simplified "not taken".
