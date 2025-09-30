@@ -190,5 +190,8 @@ int finish(int outFd)
 int destroy(void)
 {
     // free any internally allocated memory here
+    free(predictor);
+    free(BTB);
+    free(self);
     return 0;
 }
