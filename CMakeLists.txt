@@ -20,5 +20,6 @@ add_subdirectory(simpleCache)
 add_subdirectory(memory)
 add_subdirectory(cacheSim)
 add_subdirectory(branchSim)
+add_subdirectory(simProcessor)
 
 project(cadss C)
