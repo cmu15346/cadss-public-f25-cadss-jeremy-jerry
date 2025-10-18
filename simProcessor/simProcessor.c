@@ -304,14 +304,44 @@ void dispatch() {
         }
         RS* rs = malloc(sizeof(RS));
         rs->isLongALU = (op->op == ALU_LONG);
-        reg* src1 = &rf->regs[op->src_reg[0]];
-        reg* src2 = &rf->regs[op->src_reg[1]];
-        reg* dest = &rf->regs[op->dest_reg];
+        rs->srcs = malloc(2 * sizeof(reg*));
+        int reg1 = op->src_reg[0];
+        int reg2 = op->src_reg[1];
+        int regD = op->dest_reg;
+        reg* src1;
+        reg* src2;
+        if (reg1 == -1) {
+            src1 = NULL;
+        } else {
+            src1 = &rf->regs[reg1];
+        }
+        if (reg2 == -1) {
+            src2 = NULL;
+        } else {
+            src2 = &rf->regs[reg2];
+        }
+        reg* dest;
+        if (regD != -1) {
+            dest = &rf->regs[op->dest_reg];
+        }
+        else {
+            dest = NULL;
+        }
         rs->dest = malloc(sizeof(reg));
-        rs->dest->num = dest->num;
+        if (dest != NULL) {
+            rs->dest->num = dest->num;
+        }
+        else {
+            rs->dest->num = -1;
+        }
         //check source readiness/update tags
         for (int i = 0; i < 2; i++) {
             reg* src = (i == 0) ? src1 : src2;
+            if (src == NULL) {
+                rs->srcs[i] = malloc(sizeof(reg));
+                rs->srcs[i]->ready = true;
+                continue;
+            }
             rs->srcs[i] = malloc(sizeof(reg));
             rs->srcs[i]->num = src->num;
             if (src->ready) {
@@ -322,8 +352,10 @@ void dispatch() {
                 rs->srcs[i]->tag = src->tag;
             }
             int64_t tag = getNextTag();
-            dest->tag = tag;
-            dest->ready = false;
+            if (dest != NULL) {
+                dest->tag = tag;
+                dest->ready = false;
+            }
             rs->dest->tag = tag;
             rs->dest->ready = false;
         }
@@ -363,9 +395,27 @@ void schedule() {
 }
 
 //execute stage
-SQEntry* completed = NULL;
+typedef struct _wrapper {
+    SQEntry* entry;
+    struct _wrapper* next;
+    struct _wrapper* prev;
+} completedNode;
 
-void addToCompleted(SQEntry* entry) {
+completedNode* completed = NULL;
+
+bool completed_contains(SQEntry* e) {
+    for (completedNode* n = completed; n != NULL; n = n->next) {
+        if (n->entry == e) return true;
+    }
+    return false;
+}
+
+void addToCompleted(SQEntry* e) {
+    //assert(!completed_contains(e));
+    completedNode* entry = malloc(sizeof(completedNode));
+    entry->entry = e;
+    entry->next = NULL;
+    entry->prev = NULL;
     if (completed == NULL) {
         completed = entry;
         entry->next = NULL;
@@ -383,23 +433,24 @@ SQEntry* removeByMinTag() {
     if (completed == NULL) {
         return NULL;
     }
-    SQEntry* minEntry = completed;
-    for (SQEntry* entry = completed; entry != NULL; entry = entry->next) {
-        if (entry->rs->dest->tag < minEntry->rs->dest->tag) {
+    completedNode* minEntry = completed;
+    for (completedNode* entry = completed; entry != NULL; entry = entry->next) {
+        if (entry->entry->rs->dest->tag < minEntry->entry->rs->dest->tag) {
             minEntry = entry;
         }
     }
     //remove minEntry from completed list
     if (minEntry->prev != NULL) {
         minEntry->prev->next = minEntry->next;
-    }
-    else {
+    } else {
         completed = minEntry->next;
     }
     if (minEntry->next != NULL) {
         minEntry->next->prev = minEntry->prev;
     }
-    return minEntry;
+    SQEntry* returnEntry = minEntry->entry;
+    free(minEntry);
+    return returnEntry;
 }
 
 void execute() {
@@ -448,6 +499,11 @@ void stateUpdate() {
         cdbs[i].busy = true;
         cdbs[i].tag = rs->dest->tag;
         cdbs[i].dest = rs->dest;
+        if (rs->dest->num == -1) {
+            //no destination register
+            removeFromSQ(entry);
+            continue;
+        }
         reg* destReg = &rf->regs[rs->dest->num];
         if (destReg->tag == rs->dest->tag) {
             destReg->ready = true;
@@ -594,31 +650,39 @@ int tick(void)
             continue;
 
         progress = 1;
+        bool hasSpaceInDQ;
+        for (int j = 0; j < fetchRate; j++) {
+            switch (nextOp->op)
+            {
+                case MEM_LOAD:
+                case MEM_STORE:
+                    pendingMem[i] = 1;
+                    cs->memoryRequest(nextOp, i, makeTag(i, memOpTag[i]),
+                                    memOpCallback);
+                    break;
 
-        switch (nextOp->op)
-        {
-            case MEM_LOAD:
-            case MEM_STORE:
-                pendingMem[i] = 1;
-                cs->memoryRequest(nextOp, i, makeTag(i, memOpTag[i]),
-                                  memOpCallback);
+                case BRANCH:
+                    pendingBranch[i]
+                        = (bs->branchRequest(nextOp, i) == nextOp->nextPCAddress)
+                            ? 0
+                            : 1;
+                    break;
+
+                case ALU:
+                case ALU_LONG:
+                    hasSpaceInDQ = addToDQ(nextOp);
+                    break;
+            }
+            nextOp = tr->getNextOp(i);
+            if (nextOp == NULL || !hasSpaceInDQ) {
                 break;
-
-            case BRANCH:
-                pendingBranch[i]
-                    = (bs->branchRequest(nextOp, i) == nextOp->nextPCAddress)
-                          ? 0
-                          : 1;
-                break;
-
-            case ALU:
-            case ALU_LONG:
-
-                break;
+            }
         }
-
-        free(nextOp);
     }
+    stateUpdate();
+    execute();
+    schedule();
+    dispatch();
 
     return progress;
 }
