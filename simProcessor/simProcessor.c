@@ -36,6 +36,8 @@ typedef struct _reservationStation {
     reg** srcs;
     reg* dest;
     bool isLongALU;
+    struct _reservationStation* next;
+    struct _reservationStation* prev;
 } RS;
 
 typedef struct _commonDataBus {
@@ -71,14 +73,8 @@ typedef struct _dispatchQueue {
     int maxSize;
 } dispatchQueue;
 
-typedef struct _SQEntry {
-    RS* rs;
-    struct _SQEntry* next;
-    struct _SQEntry* prev;
-} SQEntry;
-
 typedef struct scheduleQueue {
-    SQEntry* head;
+    RS* head;
     int sizeFast;
     int sizeLong;
     int maxFastSize;
@@ -88,9 +84,9 @@ typedef struct scheduleQueue {
 typedef struct _functionUnit {
     bool busy;
     bool isLongALU;
-    SQEntry* executingEntry1;
-    SQEntry* executingEntry2;
-    SQEntry* executingEntry3;
+    RS* executingEntry1;
+    RS* executingEntry2;
+    RS* executingEntry3;
 } FU;
 
 
@@ -221,13 +217,11 @@ bool isFullSQ(bool isLongALU) {
     }
 }
 
-bool addToSQ(RS* rs, bool isLongALU) {
+bool addToSQ(RS* newEntry, bool isLongALU) {
     if (isLongALU) {
         if (SQ->sizeLong >= SQ->maxLongSize) {
             return false;
         }
-        SQEntry* newEntry = malloc(sizeof(SQEntry));
-        newEntry->rs = rs;
         newEntry->next = SQ->head;
         newEntry->prev = NULL;
         if (SQ->head != NULL) {
@@ -241,8 +235,6 @@ bool addToSQ(RS* rs, bool isLongALU) {
         if (SQ->sizeFast >= SQ->maxFastSize) {
             return false;
         }
-        SQEntry* newEntry = malloc(sizeof(SQEntry));
-        newEntry->rs = rs;
         newEntry->next = SQ->head;
         newEntry->prev = NULL;
         if (SQ->head != NULL) {
@@ -254,8 +246,8 @@ bool addToSQ(RS* rs, bool isLongALU) {
     }
 }
 
-RS* removeFromSQ(SQEntry* entry){
-    if (entry->rs->isLongALU) {
+void removeFromSQ(RS* entry){
+    if (entry->isLongALU) {
         if (entry->prev != NULL) {
             entry->prev->next = entry->next;
         }
@@ -279,9 +271,7 @@ RS* removeFromSQ(SQEntry* entry){
         }
         SQ->sizeFast--;
     }
-    RS* rs = entry->rs;
     free(entry);
-    return rs;
 }
 
 // Dispatch stage
@@ -303,6 +293,7 @@ void dispatch() {
             break;
         }
         RS* rs = malloc(sizeof(RS));
+        rs->FU = NULL;
         rs->isLongALU = (op->op == ALU_LONG);
         rs->srcs = malloc(2 * sizeof(reg*));
         int reg1 = op->src_reg[0];
@@ -368,10 +359,14 @@ void dispatch() {
 //schedule stage
 void schedule() {
     int scheduled = 0;
-    for (SQEntry* entry = SQ->head; entry != NULL && scheduled < scheduleWidth; entry = entry->next) {
-        RS* rs = entry->rs;
+    for (RS* rs = SQ->head; rs != NULL && scheduled < scheduleWidth; rs = rs->next) {
         //check if CDB broadcasted one of our dependencies
         //set all CDBs to be not busy after we cal this function
+        if (rs->FU != NULL) {
+            //printf("RS %p already has FU %p\n", rs, rs->FU);
+            continue; //already scheduled
+        }
+        //printf("Scheduling RS %p\n", rs);
         for (int i = 0; i < numCDB; i++) {
             if (cdbs[i].busy) {
                 for (int j = 0; j < 2; j++) {
@@ -387,7 +382,7 @@ void schedule() {
             if (fu != NULL) {
                 rs->FU = fu; 
                 fu->busy = true;
-                fu->executingEntry1 = entry;
+                fu->executingEntry1 = rs;
                 scheduled++;
             }
         }
@@ -396,24 +391,24 @@ void schedule() {
 
 //execute stage
 typedef struct _wrapper {
-    SQEntry* entry;
+    RS* rs;
     struct _wrapper* next;
     struct _wrapper* prev;
 } completedNode;
 
 completedNode* completed = NULL;
 
-bool completed_contains(SQEntry* e) {
+bool completed_contains(RS* e) {
     for (completedNode* n = completed; n != NULL; n = n->next) {
-        if (n->entry == e) return true;
+        if (n->rs == e) return true;
     }
     return false;
 }
 
-void addToCompleted(SQEntry* e) {
+void addToCompleted(RS* e) {
     //assert(!completed_contains(e));
     completedNode* entry = malloc(sizeof(completedNode));
-    entry->entry = e;
+    entry->rs = e;
     entry->next = NULL;
     entry->prev = NULL;
     if (completed == NULL) {
@@ -429,13 +424,13 @@ void addToCompleted(SQEntry* e) {
     }
 }
 
-SQEntry* removeByMinTag() {
+RS* removeByMinTag() {
     if (completed == NULL) {
         return NULL;
     }
     completedNode* minEntry = completed;
     for (completedNode* entry = completed; entry != NULL; entry = entry->next) {
-        if (entry->entry->rs->dest->tag < minEntry->entry->rs->dest->tag) {
+        if (entry->rs->dest->tag < minEntry->rs->dest->tag) {
             minEntry = entry;
         }
     }
@@ -448,7 +443,7 @@ SQEntry* removeByMinTag() {
     if (minEntry->next != NULL) {
         minEntry->next->prev = minEntry->prev;
     }
-    SQEntry* returnEntry = minEntry->entry;
+    RS* returnEntry = minEntry->rs;
     free(minEntry);
     return returnEntry;
 }
@@ -491,24 +486,23 @@ void stateUpdate() {
         cdbs[i].dest = NULL;
     }
     for (int i = 0; i < numCDB; i++) {
-        SQEntry* entry = removeByMinTag();
-        if (entry == NULL) {
+        RS* rs = removeByMinTag();
+        if (rs == NULL) {
             break;
         }
-        RS* rs = entry->rs;
         cdbs[i].busy = true;
         cdbs[i].tag = rs->dest->tag;
         cdbs[i].dest = rs->dest;
         if (rs->dest->num == -1) {
             //no destination register
-            removeFromSQ(entry);
+            removeFromSQ(rs);
             continue;
         }
         reg* destReg = &rf->regs[rs->dest->num];
         if (destReg->tag == rs->dest->tag) {
             destReg->ready = true;
         }
-        removeFromSQ(entry);
+        removeFromSQ(rs);
     }
 }
 
@@ -656,17 +650,17 @@ int tick(void)
             {
                 case MEM_LOAD:
                 case MEM_STORE:
-                    pendingMem[i] = 1;
-                    cs->memoryRequest(nextOp, i, makeTag(i, memOpTag[i]),
-                                    memOpCallback);
-                    break;
+                    // pendingMem[i] = 1;
+                    // cs->memoryRequest(nextOp, i, makeTag(i, memOpTag[i]),
+                    //                 memOpCallback);
+                    // break;
 
                 case BRANCH:
-                    pendingBranch[i]
-                        = (bs->branchRequest(nextOp, i) == nextOp->nextPCAddress)
-                            ? 0
-                            : 1;
-                    break;
+                    // pendingBranch[i]
+                    //     = (bs->branchRequest(nextOp, i) == nextOp->nextPCAddress)
+                    //         ? 0
+                    //         : 1;
+                    // break;
 
                 case ALU:
                 case ALU_LONG:
