@@ -1,2 +1,3 @@
 __cache__:cacheSim
 __branch__:branchSim
+__processor__:simProcessor

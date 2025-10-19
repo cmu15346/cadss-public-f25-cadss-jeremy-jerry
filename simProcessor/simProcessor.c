@@ -43,7 +43,6 @@ typedef struct _reservationStation {
 typedef struct _commonDataBus {
     bool busy;
     int64_t tag;
-    reg* dest;
 } CDB;
 
 int processorCount = 1;
@@ -141,7 +140,6 @@ void initialize() {
     for (int i = 0; i < numCDB; i++) {
         cdbs[i].busy = false;
         cdbs[i].tag = -1;
-        cdbs[i].dest = NULL;
     }
 }
 
@@ -165,6 +163,9 @@ FU* getFreeFU(bool isLongALU) {
 }
 
 //dispatch stage operations
+bool isFullDQ() {
+    return DQ->size >= DQ->maxSize;
+}
 
 bool addToDQ(trace_op* op) {
     if (DQ->size >= DQ->maxSize) {
@@ -275,7 +276,7 @@ void removeFromSQ(RS* entry){
 }
 
 // Dispatch stage
-void dispatch() {
+int dispatch() {
     int dispatched = 0;
     while (dispatched < dispatchWidth) {
         trace_op* nextOp = peekDQ();
@@ -342,22 +343,23 @@ void dispatch() {
                 rs->srcs[i]->ready = false;
                 rs->srcs[i]->tag = src->tag;
             }
-            int64_t tag = getNextTag();
-            if (dest != NULL) {
-                dest->tag = tag;
-                dest->ready = false;
-            }
-            rs->dest->tag = tag;
-            rs->dest->ready = false;
         }
+        int64_t tag = getNextTag();
+        if (dest != NULL) {
+            dest->tag = tag;
+            dest->ready = false;
+        }
+        rs->dest->tag = tag;
+        rs->dest->ready = false;
         //add to schedule queue(we know it has room if we get here)
         addToSQ(rs, isLongALU);
         dispatched++;
     }
+    return dispatched;
 }
 
 //schedule stage
-void schedule() {
+int schedule() {
     int scheduled = 0;
     for (RS* rs = SQ->head; rs != NULL && scheduled < scheduleWidth; rs = rs->next) {
         //check if CDB broadcasted one of our dependencies
@@ -387,6 +389,7 @@ void schedule() {
             }
         }
     }
+    return scheduled;
 }
 
 //execute stage
@@ -448,11 +451,13 @@ RS* removeByMinTag() {
     return returnEntry;
 }
 
-void execute() {
+int execute() {
     //for each FU, if busy, execute
+    int executed = 0;
     for (int i = 0; i < numFastALU; i++) {
         FU* fu = &sb->fastALUs[i];
         if (fu->busy && fu->executingEntry1 != NULL) {
+            executed++;
             //not pipelined, so complete in one cycle
             fu->busy = false;
             addToCompleted(fu->executingEntry1);
@@ -463,36 +468,40 @@ void execute() {
         FU* fu = &sb->longALUs[i];
         //pipelined FU, so we can have up to 3 entries executing
         if (fu->executingEntry3 != NULL) {
+            executed++;
             addToCompleted(fu->executingEntry3);
             fu->executingEntry3 = NULL;
         }
         if (fu->executingEntry2 != NULL) {
+            executed++;
             fu->executingEntry3 = fu->executingEntry2;
             fu->executingEntry2 = NULL;
         }
         if (fu->busy && fu->executingEntry1 != NULL) {
+            executed++;
             fu->busy = false;
             fu->executingEntry2 = fu->executingEntry1;
             fu->executingEntry1 = NULL;
         }
     }
+    return executed;
 }
 
 //state update stage
-void stateUpdate() {
+int stateUpdate() {
+    int updated = 0;
     for (int i = 0; i < numCDB; i++) {
         cdbs[i].busy = false;
         cdbs[i].tag = -1;
-        cdbs[i].dest = NULL;
     }
     for (int i = 0; i < numCDB; i++) {
         RS* rs = removeByMinTag();
         if (rs == NULL) {
             break;
         }
+        updated++;
         cdbs[i].busy = true;
         cdbs[i].tag = rs->dest->tag;
-        cdbs[i].dest = rs->dest;
         if (rs->dest->num == -1) {
             //no destination register
             removeFromSQ(rs);
@@ -504,6 +513,7 @@ void stateUpdate() {
         }
         removeFromSQ(rs);
     }
+    return updated;
 }
 
 //
@@ -598,8 +608,6 @@ int tick(void)
     //   each tick until it reaches a branch or memory op
     //   then it blocks on that op
 
-    trace_op* nextOp = NULL;
-
     // Pass along to the branch predictor and cache simulator that time ticked
     bs->si.tick();
     cs->si.tick();
@@ -638,14 +646,17 @@ int tick(void)
         }
 
         // TODO: get and manage ops for each processor core
-        nextOp = tr->getNextOp(i);
 
-        if (nextOp == NULL)
-            continue;
-
-        progress = 1;
         bool hasSpaceInDQ;
         for (int j = 0; j < fetchRate; j++) {
+            if (isFullDQ()) {
+                break;
+            }
+            trace_op* nextOp = tr->getNextOp(i);
+            if (nextOp == NULL) {
+                break;
+            }
+            progress = 1;
             switch (nextOp->op)
             {
                 case MEM_LOAD:
@@ -664,20 +675,36 @@ int tick(void)
 
                 case ALU:
                 case ALU_LONG:
-                    hasSpaceInDQ = addToDQ(nextOp);
+                    addToDQ(nextOp);
                     break;
-            }
-            nextOp = tr->getNextOp(i);
-            if (nextOp == NULL || !hasSpaceInDQ) {
-                break;
             }
         }
     }
-    stateUpdate();
-    execute();
-    schedule();
-    dispatch();
-
+    int executed = execute();
+    int updated = stateUpdate();
+    int dispatched = dispatch();
+    int scheduled = schedule();
+    int inDQ = DQ->size;
+    if (updated || executed || scheduled || dispatched || inDQ) {
+        progress = 1;
+    }
+    // printf("progress: %d\n", progress);
+    // printf("schedule: %d, execute: %d, stateUpdate: %d, dispatch: %d\n",
+    //        scheduled, executed, updated, dispatched);
+    // printf("DQ size: %d, SQ fast size: %d, SQ long size: %d\n",
+    //        DQ->size, SQ->sizeFast, SQ->sizeLong);
+    // printf("isFullDQ: %d\n", isFullDQ());
+    // printf("isFullSQ fast: %d, isFullSQ long: %d\n",
+    //        isFullSQ(false), isFullSQ(true));
+    // printf("CDBs: ");
+    // for (int i = 0; i < numCDB; i++) {
+    //     if (cdbs[i].busy) {
+    //         printf("[tag: %ld] ", cdbs[i].tag);
+    //     } else {
+    //         printf("[idle] ");
+    //     }
+    // }
+    // printf("\n");
     return progress;
 }
 
