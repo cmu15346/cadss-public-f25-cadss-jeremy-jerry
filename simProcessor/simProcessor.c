@@ -302,18 +302,18 @@ int dispatch() {
         int regD = op->dest_reg;
         reg* src1;
         reg* src2;
-        if (reg1 == -1 || reg1 == 32) {
+        if (reg1 == -1) {
             src1 = NULL;
         } else {
             src1 = &rf->regs[reg1];
         }
-        if (reg2 == -1 || reg2 == 32) {
+        if (reg2 == -1) {
             src2 = NULL;
         } else {
             src2 = &rf->regs[reg2];
         }
         reg* dest;
-        if (regD != -1 && regD != 32) {
+        if (regD != -1) {
             dest = &rf->regs[op->dest_reg];
         }
         else {
@@ -365,7 +365,7 @@ int dispatch() {
 //schedule stage
 int schedule() {
     int scheduled = 0;
-    for (RS* rs = SQ->head; rs != NULL && scheduled < scheduleWidth; rs = rs->next) {
+    for (RS* rs = SQ->head; rs != NULL; rs = rs->next) {
         //check if CDB broadcasted one of our dependencies
         //set all CDBs to be not busy after we cal this function
         if (rs->FU != NULL) {
@@ -382,7 +382,7 @@ int schedule() {
                 }
             }
         }
-        if (rs->srcs[0]->ready && rs->srcs[1]->ready) {
+        if (rs->srcs[0]->ready && rs->srcs[1]->ready && scheduled < scheduleWidth) {
             //wake up, FIFO selection
             FU* fu = getFreeFU(rs->isLongALU);
             if (fu != NULL) {
@@ -684,8 +684,8 @@ int tick(void)
             }
         }
     }
-    int executed = execute();
     int updated = stateUpdate();
+    int executed = execute();
     int scheduled = schedule();
     int dispatched = dispatch();
     int inDQ = DQ->size;
@@ -693,11 +693,11 @@ int tick(void)
     if (updated || executed || scheduled || dispatched || inDQ || inSQ) {
         progress = 1;
     }
-    if (tickCount % 10000 == 0) {
-        printf("Tick %ld: dispatched %d, scheduled %d, executed %d, updated %d, DQ size %d, SQ size %d\n",
-               tickCount, dispatched, scheduled, executed, updated, DQ->size,
-               SQ->sizeFast + SQ->sizeLong);
-    }
+    // if (tickCount % 10000 == 0) {
+    //     printf("Tick %ld: dispatched %d, scheduled %d, executed %d, updated %d, DQ size %d, SQ size %d\n",
+    //            tickCount, dispatched, scheduled, executed, updated, DQ->size,
+    //            SQ->sizeFast + SQ->sizeLong);
+    // }
     if (tickCount > 1000000) {
         printf("No progress after 1,000,000 ticks.  Exiting.\n");
         // Print contents of the schedule queue (SQ)
