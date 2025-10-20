@@ -43,6 +43,7 @@ typedef struct _reservationStation {
 typedef struct _commonDataBus {
     bool busy;
     int64_t tag;
+    int64_t tickIssued;
 } CDB;
 
 int processorCount = 1;
@@ -86,6 +87,7 @@ typedef struct _functionUnit {
     RS* executingEntry1;
     RS* executingEntry2;
     RS* executingEntry3;
+    RS* completedEntry;
 } FU;
 
 
@@ -94,6 +96,10 @@ scheduleQueue* SQ = NULL;
 scoreboard* sb = NULL;
 RF* rf = NULL;
 CDB* cdbs = NULL;
+CDB* cdbsIssued = NULL;
+const int64_t STALL_TIME = 100000;
+int64_t tickCount = 0;
+int64_t stallCount = -1;
 
 int64_t getNextTag() {
     int64_t tag = tagCounter;
@@ -137,9 +143,12 @@ void initialize() {
     SQ->maxLongSize = scheduleWidth * numLongALU;
     //initialize CDBs
     cdbs = malloc(numCDB * sizeof(CDB));
+    cdbsIssued = malloc(numCDB * sizeof(CDB));
     for (int i = 0; i < numCDB; i++) {
         cdbs[i].busy = false;
         cdbs[i].tag = -1;
+        cdbsIssued[i].busy = false;
+        cdbsIssued[i].tag = -1;
     }
 }
 
@@ -362,6 +371,28 @@ int dispatch() {
     return dispatched;
 }
 
+RS* readyToFire[1024];
+
+void addReadyToFire(RS* rs) {
+    for (int i = 0; i < 1024; i++) {
+        if (readyToFire[i] == NULL) {
+            readyToFire[i] = rs;
+            return;
+        }
+    }
+}
+
+void fireReadyToFire() {
+    for (int i = 0; i < 1024; i++) {
+        if (readyToFire[i] != NULL) {
+            RS* rs = readyToFire[i];
+            FU* fu = rs->FU;
+            fu->executingEntry1 = rs;
+            readyToFire[i] = NULL;
+        }
+    }
+}
+
 //schedule stage
 int schedule() {
     int scheduled = 0;
@@ -388,7 +419,7 @@ int schedule() {
             if (fu != NULL) {
                 rs->FU = fu; 
                 fu->busy = true;
-                fu->executingEntry1 = rs;
+                addReadyToFire(rs);
                 scheduled++;
             }
         }
@@ -499,6 +530,10 @@ int execute() {
 int stateUpdate() {
     int updated = 0;
     for (int i = 0; i < numCDB; i++) {
+        cdbsIssued[i].busy = false;
+        cdbsIssued[i].tag = -1;
+    }
+    for (int i = 0; i < numCDB; i++) {
         RS* rs = removeByMinTag();
         if (rs == NULL) {
             break;
@@ -518,6 +553,16 @@ int stateUpdate() {
         removeFromSQ(rs);
     }
     return updated;
+}
+
+void shiftCDBs()
+{
+    for (int i = 0; i < numCDB; i++) {
+        cdbs[i].tag = cdbsIssued[i].tag;
+        cdbs[i].busy = cdbsIssued[i].busy;
+        cdbsIssued[i].busy = false;
+        cdbsIssued[i].tag = -1;
+    }
 }
 
 //
@@ -579,10 +624,6 @@ processor* init(processor_sim_args* psa)
     return self;
 }
 
-const int64_t STALL_TIME = 100000;
-int64_t tickCount = 0;
-int64_t stallCount = -1;
-
 int64_t makeTag(int procNum, int64_t baseTag)
 {
     return ((int64_t)procNum) | (baseTag << 8);
@@ -605,6 +646,7 @@ void memOpCallback(int procNum, int64_t tag)
     }
 }
 
+int instructionCount = 0;
 int tick(void)
 {
     // if room in pipeline, request op from trace
@@ -686,8 +728,11 @@ int tick(void)
     }
     int updated = stateUpdate();
     int executed = execute();
+    fireReadyToFire();
+    instructionCount += executed;
     int scheduled = schedule();
     int dispatched = dispatch();
+    shiftCDBs();
     int inDQ = DQ->size;
     int inSQ = SQ->sizeFast + SQ->sizeLong;
     if (updated || executed || scheduled || dispatched || inDQ || inSQ) {
@@ -748,6 +793,7 @@ int tick(void)
 
 int finish(int outFd)
 {
+    //printf("Total Instructions Executed: %d\n", instructionCount);
     int c = cs->si.finish(outFd);
     int b = bs->si.finish(outFd);
 
