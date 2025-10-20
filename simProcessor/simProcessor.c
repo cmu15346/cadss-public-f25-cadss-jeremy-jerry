@@ -374,6 +374,10 @@ int dispatch() {
 RS* readyToFire[1024];
 
 void addReadyToFire(RS* rs) {
+    // if (!rs->isLongALU) {
+    //     rs->FU->executingEntry1 = rs;
+    //     return;
+    // }
     for (int i = 0; i < 1024; i++) {
         if (readyToFire[i] == NULL) {
             readyToFire[i] = rs;
@@ -526,6 +530,21 @@ int execute() {
     return executed;
 }
 
+RS* toRemoveFromSQ[1024];
+int toRemoveCount = 0;
+void addToRemoveFromSQ(RS* rs) {
+    toRemoveFromSQ[toRemoveCount] = rs;
+    toRemoveCount++;
+}
+void clearToRemoveFromSQ() {
+    toRemoveCount = 0;
+}
+void removeAllFromSQ() {
+    for (int i = 0; i < toRemoveCount; i++) {
+        removeFromSQ(toRemoveFromSQ[i]);
+    }
+    clearToRemoveFromSQ();
+}
 //state update stage
 int stateUpdate() {
     int updated = 0;
@@ -539,18 +558,18 @@ int stateUpdate() {
             break;
         }
         updated++;
-        cdbs[i].busy = true;
-        cdbs[i].tag = rs->dest->tag;
+        cdbsIssued[i].busy = true;
+        cdbsIssued[i].tag = rs->dest->tag;
         if (rs->dest->num == -1) {
             //no destination register
-            removeFromSQ(rs);
+            addToRemoveFromSQ(rs);
             continue;
         }
         reg* destReg = &rf->regs[rs->dest->num];
         if (destReg->tag == rs->dest->tag) {
             destReg->ready = true;
         }
-        removeFromSQ(rs);
+        addToRemoveFromSQ(rs);
     }
     return updated;
 }
@@ -707,17 +726,17 @@ int tick(void)
             {
                 case MEM_LOAD:
                 case MEM_STORE:
-                    // pendingMem[i] = 1;
-                    // cs->memoryRequest(nextOp, i, makeTag(i, memOpTag[i]),
-                    //                 memOpCallback);
-                    // break;
+                    pendingMem[i] = 1;
+                    cs->memoryRequest(nextOp, i, makeTag(i, memOpTag[i]),
+                                    memOpCallback);
+                    break;
 
                 case BRANCH:
-                    // pendingBranch[i]
-                    //     = (bs->branchRequest(nextOp, i) == nextOp->nextPCAddress)
-                    //         ? 0
-                    //         : 1;
-                    // break;
+                    pendingBranch[i]
+                        = (bs->branchRequest(nextOp, i) == nextOp->nextPCAddress)
+                            ? 0
+                            : 1;
+                    break;
 
                 case ALU:
                 case ALU_LONG:
@@ -726,13 +745,13 @@ int tick(void)
             }
         }
     }
-    int updated = stateUpdate();
     int executed = execute();
+    int updated = stateUpdate();
     fireReadyToFire();
-    instructionCount += executed;
     int scheduled = schedule();
     int dispatched = dispatch();
     shiftCDBs();
+    removeAllFromSQ();
     int inDQ = DQ->size;
     int inSQ = SQ->sizeFast + SQ->sizeLong;
     if (updated || executed || scheduled || dispatched || inDQ || inSQ) {
