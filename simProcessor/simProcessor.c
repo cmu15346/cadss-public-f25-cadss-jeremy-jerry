@@ -842,6 +842,16 @@ int finish(int outFd)
 
 int destroy(void)
 {
+    free(sb->fastALUs);
+    free(sb->longALUs);
+    free(sb);
+    free(rf->regs);
+    free(rf);
+    free(DQ);
+    free(SQ);
+    free(cdbs);
+    free(cdbsIssued);
+
     int c = cs->si.destroy();
     int b = bs->si.destroy();
 
