@@ -745,10 +745,10 @@ int tick(void)
             }
         }
     }
-    int executed = execute();
     int updated = stateUpdate();
-    fireReadyToFire();
+    int executed = execute();
     int scheduled = schedule();
+    fireReadyToFire();
     int dispatched = dispatch();
     shiftCDBs();
     removeAllFromSQ();
