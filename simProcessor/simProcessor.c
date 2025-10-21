@@ -776,34 +776,34 @@ int tick(void)
     //            tickCount, dispatched, scheduled, executed, updated, DQ->size,
     //            SQ->sizeFast + SQ->sizeLong);
     // }
-    if (tickCount > 1000000) {
-        printf("No progress after 1,000,000 ticks.  Exiting.\n");
-        // Print contents of the schedule queue (SQ)
-        printf("Schedule Queue: sizeFast=%d sizeLong=%d\n", SQ->sizeFast, SQ->sizeLong);
-        RS* _sq_node = SQ->head;
-        int _sq_idx = 0;
-        while (_sq_node != NULL) {
-            printf("SQ[%d] addr=%p isLongALU=%d FU=%p dest.num=%d dest.tag=%ld",
-                   _sq_idx, (void*)_sq_node, _sq_node->isLongALU, (void*)_sq_node->FU,
-                   _sq_node->dest ? _sq_node->dest->num : -1,
-                   _sq_node->dest ? _sq_node->dest->tag : -1);
-            for (int _s = 0; _s < 2; _s++) {
-                if (_sq_node->srcs && _sq_node->srcs[_s]) {
-                    printf(" src%d(ready=%d,num=%d,tag=%ld)",
-                           _s,
-                           _sq_node->srcs[_s]->ready ? 1 : 0,
-                           _sq_node->srcs[_s]->num,
-                           _sq_node->srcs[_s]->tag);
-                } else {
-                    printf(" src%d(NULL)", _s);
-                }
-            }
-            printf("\n");
-            _sq_node = _sq_node->next;
-            _sq_idx++;
-        }
-        exit(1);
-    }
+    // if (tickCount > 1000000) {
+    //     printf("No progress after 1,000,000 ticks.  Exiting.\n");
+    //     // Print contents of the schedule queue (SQ)
+    //     printf("Schedule Queue: sizeFast=%d sizeLong=%d\n", SQ->sizeFast, SQ->sizeLong);
+    //     RS* _sq_node = SQ->head;
+    //     int _sq_idx = 0;
+    //     while (_sq_node != NULL) {
+    //         printf("SQ[%d] addr=%p isLongALU=%d FU=%p dest.num=%d dest.tag=%ld",
+    //                _sq_idx, (void*)_sq_node, _sq_node->isLongALU, (void*)_sq_node->FU,
+    //                _sq_node->dest ? _sq_node->dest->num : -1,
+    //                _sq_node->dest ? _sq_node->dest->tag : -1);
+    //         for (int _s = 0; _s < 2; _s++) {
+    //             if (_sq_node->srcs && _sq_node->srcs[_s]) {
+    //                 printf(" src%d(ready=%d,num=%d,tag=%ld)",
+    //                        _s,
+    //                        _sq_node->srcs[_s]->ready ? 1 : 0,
+    //                        _sq_node->srcs[_s]->num,
+    //                        _sq_node->srcs[_s]->tag);
+    //             } else {
+    //                 printf(" src%d(NULL)", _s);
+    //             }
+    //         }
+    //         printf("\n");
+    //         _sq_node = _sq_node->next;
+    //         _sq_idx++;
+    //     }
+    //     exit(1);
+    // }
     // printf("progress: %d\n", progress);
     // printf("schedule: %d, execute: %d, stateUpdate: %d, dispatch: %d\n",
     //        scheduled, executed, updated, dispatched);
