@@ -107,6 +107,19 @@ int64_t getNextTag() {
     return tag;
 }
 
+void freeDQEntry(DQEntry* entry) {
+    free(entry);
+}
+
+void freeRS(RS* rs) {
+    for (int i = 0; i < 2; i++) {
+        free(rs->srcs[i]);
+    }
+    free(rs->srcs);
+    free(rs->dest);
+    free(rs);
+}
+
 void initialize() {
     //initialize functional units
     sb = malloc(sizeof(scoreboard));
@@ -205,7 +218,7 @@ trace_op* removeFromDQ() {
     if (DQ->head == NULL) {
         DQ->tail = NULL;
     }
-    free(entry);
+    freeDQEntry(entry);
     DQ->size--;
     return op;
 }
@@ -281,7 +294,7 @@ void removeFromSQ(RS* entry){
         }
         SQ->sizeFast--;
     }
-    free(entry);
+    freeRS(entry);
 }
 
 // Dispatch stage
@@ -365,6 +378,7 @@ int dispatch() {
             rs->dest->ready = true;
         }
         //add to schedule queue(we know it has room if we get here)
+        free(op);
         addToSQ(rs, isLongALU);
         dispatched++;
     }
