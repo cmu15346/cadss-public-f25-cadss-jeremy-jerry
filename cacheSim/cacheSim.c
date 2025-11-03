@@ -199,8 +199,16 @@ void coherCallback(int type, int processorNum, int64_t addr)
             }
             else{
                 pr = pr->next;
+                pendingRequest* prevPr = pendPermReq;
+                assert(pr != NULL);
+                while (pr->evictedAddr != addr || pr->processorNum != processorNum) {
+                    prevPr = pr;
+                    pr = pr->next;
+                    assert(pr != NULL);
+                }
                 assert(pr->evictedAddr == addr);
-                pendPermReq->next = pr->next;
+                assert(pr->processorNum == processorNum);
+                prevPr->next = pr->next;
                 pr->next = readyPermReq;
                 readyPermReq = pr;
             }
@@ -212,10 +220,18 @@ void coherCallback(int type, int processorNum, int64_t addr)
                 pr->next = readyReq;
                 readyReq = pr;
             }
-            else{
+            else {
                 pr = pr->next;
+                pendingRequest* prevPr = pendReq;
+                assert(pr != NULL);
+                while (pr->addr != addr || pr->processorNum != processorNum) {
+                    prevPr = pr;
+                    pr = pr->next;
+                    assert (pr != NULL);
+                }
                 assert(pr->addr == addr);
-                pendReq->next = pr->next;
+                assert(pr->processorNum == processorNum);
+                prevPr->next = pr->next;
                 pr->next = readyReq;
                 readyReq = pr;
             }
