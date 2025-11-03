@@ -669,13 +669,13 @@ void memOpCallback(int procNum, int64_t tag)
     // Is the completed memop one that is pending?
     if (baseTag == memOpTag[procNum])
     {
-        memOpTag[procNum]++;
+        //memOpTag[procNum]++;
         pendingMem[procNum] = 0;
         stallCount = tickCount + STALL_TIME;
     }
     else
     {
-        printf("memopTag: %ld != tag %ld\n", memOpTag[procNum], tag);
+        printf("memopTag: %ld != baseTag %ld\n", memOpTag[procNum], baseTag);
     }
 }
 
