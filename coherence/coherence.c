@@ -102,7 +102,8 @@ uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum)
                 = snoopMI(reqType, &ca, currentState, addr, processorNum);
             break;
         case MSI:
-            // TODO: Implement this.
+            nextState
+                = snoopMSI(reqType, &ca, currentState, addr, processorNum);
             break;
         case MESI:
             // TODO: Implement this.
@@ -143,6 +144,10 @@ uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum)
     {
         setState(addr, processorNum, nextState);
     }
+    if (CADSS_VERBOSE) {
+        printf("Proc %d Snoop Addr %p: %d -> %d via %d\n",
+               processorNum, (void*)addr, currentState, nextState, reqType);
+    }
 
     return 0;
 }
@@ -166,7 +171,8 @@ uint8_t permReq(uint8_t is_read, uint64_t addr, int processorNum)
             break;
 
         case MSI:
-            // TODO: Implement this.
+            nextState = cacheMSI(is_read, &permAvail, currentState, addr,
+                                processorNum);
             break;
 
         case MESI:
@@ -187,6 +193,11 @@ uint8_t permReq(uint8_t is_read, uint64_t addr, int processorNum)
     }
 
     setState(addr, processorNum, nextState);
+    if (CADSS_VERBOSE) {
+        printf("Proc %d Perm Addr %p: %d -> %d via %d\n",
+               processorNum, (void*)addr, currentState, nextState,
+               is_read ? 1 : 0);
+    }
     return permAvail;
 }
 
