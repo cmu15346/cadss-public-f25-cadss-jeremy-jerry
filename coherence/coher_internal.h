@@ -14,7 +14,7 @@ typedef enum _coherence_states
     SHARE,
     EXCLUSIVE,
     INVALID_SHARED,
-    INVALID_EXCLUSIVE,
+    INVALID_SHARED_EXCLUSIVE,
     INVALID_MODIFIED,
     SHARED_MODIFIED
 } coherence_states;
