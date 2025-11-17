@@ -353,7 +353,7 @@ snoopMESI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
             }
             if (reqType == SHARED) {
                 *ca = DATA_RECV;
-                return SHARED;
+                return SHARE;
             }
 
             return INVALID_SHARED_EXCLUSIVE;
@@ -534,7 +534,7 @@ snoopMOESI(bus_req_type reqType, cache_action* ca, coherence_states currentState
             }
             if (reqType == SHARED) {
                 *ca = DATA_RECV;
-                return SHARED;
+                return SHARE;
             }
 
             return INVALID_SHARED_EXCLUSIVE;
@@ -648,7 +648,7 @@ snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState
         case MODIFIED:
             if (reqType == BUSRD) {
                 indicateShared(addr, procNum);
-                return SHARED;
+                return SHARE;
             }
             else if (reqType == BUSWR) {
                 sendData(addr, procNum);
@@ -659,7 +659,7 @@ snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState
         case FORWARD:
             if (reqType == BUSRD) {
                 indicateShared(addr, procNum);
-                return SHARED;
+                return SHARE;
             }
             else if (reqType == BUSWR) {
                 sendData(addr, procNum);
