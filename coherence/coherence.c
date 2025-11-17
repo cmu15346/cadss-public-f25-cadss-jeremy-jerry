@@ -114,7 +114,8 @@ uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum)
                 = snoopMOESI(reqType, &ca, currentState, addr, processorNum);
             break;
         case MESIF:
-            // TODO: Implement this.
+            nextState
+                = snoopMESIF(reqType, &ca, currentState, addr, processorNum);
             break;
         default:
             fprintf(stderr, "Undefined coherence scheme - %d\n", cs);
@@ -188,7 +189,8 @@ uint8_t permReq(uint8_t is_read, uint64_t addr, int processorNum)
             break;
 
         case MESIF:
-            // TODO: Implement this.
+            nextState = cacheMESIF(is_read, &permAvail, currentState, addr,
+                                processorNum);
             break;
 
         default:

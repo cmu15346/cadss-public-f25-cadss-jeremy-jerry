@@ -542,3 +542,179 @@ snoopMOESI(bus_req_type reqType, cache_action* ca, coherence_states currentState
 
     return INVALID;
 }
+
+coherence_states
+cacheMESIF(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
+        uint64_t addr, int procNum)
+{
+    switch (currentState)
+    {
+        case INVALID:
+            *permAvail = 0;
+            if (is_read) {
+                sendBusRd(addr, procNum);
+                return INVALID_SHARED_EXCLUSIVE;
+            }
+            else {
+                sendBusWr(addr, procNum);
+                return INVALID_MODIFIED;
+            }
+        case FORWARD:
+            if (is_read)
+            {
+                *permAvail = 1;
+                return FORWARD;
+            }
+            else
+            {
+                *permAvail = 0;
+                sendBusWr(addr, procNum);
+                return MODIFIED;
+            }
+        case SHARE:
+            if (is_read)
+            {
+                *permAvail = 1;
+                return SHARE;
+            }
+            else
+            {
+                *permAvail = 0;
+                sendBusWr(addr, procNum);
+                return SHARED_MODIFIED;
+            }
+        case MODIFIED:
+            *permAvail = 1;
+            return MODIFIED;
+        case EXCLUSIVE:
+            *permAvail = 1;
+            if (is_read)
+            {
+                return EXCLUSIVE;
+            }
+            else
+            {
+                return MODIFIED;
+            }
+        case SHARED_MODIFIED:
+            if (is_read)
+            {
+                *permAvail = 1;
+            }
+            else
+            {
+                *permAvail = 0;
+            }
+            return SHARED_MODIFIED;
+        case INVALID_MODIFIED:
+            fprintf(stderr, "IM state on %lx, but request %d\n", addr,
+                    is_read);
+            *permAvail = 0;
+            return INVALID_MODIFIED;
+        case INVALID_SHARED_EXCLUSIVE:
+            *permAvail = 0;
+            if (is_read)
+            {
+                return INVALID_SHARED_EXCLUSIVE;
+            }
+            else
+            {
+                sendBusWr(addr, procNum);
+                return INVALID_MODIFIED;
+            }
+            return INVALID_SHARED_EXCLUSIVE;
+        default:
+            fprintf(stderr, "State %d not supported, found on %lx\n",
+                    currentState, addr);
+            break;
+    }
+
+    return INVALID;
+}
+
+coherence_states
+snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState,
+        uint64_t addr, int procNum)
+{
+    *ca = NO_ACTION;
+    switch (currentState)
+    {
+        case INVALID:
+            return INVALID;
+        case MODIFIED:
+            if (reqType == BUSRD) {
+                indicateShared(addr, procNum);
+                return SHARED;
+            }
+            else if (reqType == BUSWR) {
+                sendData(addr, procNum);
+                *ca = INVALIDATE;
+                return INVALID;
+            }
+            return MODIFIED;
+        case FORWARD:
+            if (reqType == BUSRD) {
+                indicateShared(addr, procNum);
+                return SHARED;
+            }
+            else if (reqType == BUSWR) {
+                sendData(addr, procNum);
+                *ca = INVALIDATE;
+                return INVALID;
+            }
+            return FORWARD;
+        case EXCLUSIVE:
+            if (reqType == BUSRD) { 
+                indicateShared(addr, procNum); 
+                return SHARE;
+            } 
+            else if (reqType == SHARED) {
+                return SHARE; 
+            } 
+            else if (reqType == BUSWR) {
+                *ca = INVALIDATE;
+                return INVALID;
+            }
+            return EXCLUSIVE;
+        case SHARE:
+            if (reqType == BUSWR)
+            {
+                *ca = INVALIDATE;
+                return INVALID;
+            }
+            return SHARE;
+        case SHARED_MODIFIED:
+            if (reqType == DATA)
+            {
+                *ca = DATA_RECV;
+                return MODIFIED;
+            }
+            return SHARED_MODIFIED;
+        case INVALID_MODIFIED:
+            if (reqType == DATA)
+            {
+                *ca = DATA_RECV;
+                return MODIFIED;
+            }
+
+            return INVALID_MODIFIED;
+        case INVALID_SHARED_EXCLUSIVE:
+            if (reqType == DATA)
+            {
+                *ca = DATA_RECV;
+                return EXCLUSIVE;
+            }
+            if (reqType == SHARED) {
+                *ca = DATA_RECV;
+                return FORWARD;
+            }
+
+            return INVALID_SHARED_EXCLUSIVE;
+        default:
+            fprintf(stderr, "State %d not supported, found on %lx\n",
+                    currentState, addr);
+            break;
+    }
+
+    return INVALID;
+}

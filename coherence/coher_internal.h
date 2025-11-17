@@ -14,6 +14,7 @@ typedef enum _coherence_states
     SHARE,
     EXCLUSIVE,
     OWNED,
+    FORWARD,
     INVALID_SHARED,
     INVALID_SHARED_EXCLUSIVE,
     INVALID_MODIFIED,
@@ -52,6 +53,12 @@ cacheMOESI(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
         uint64_t addr, int procNum);
 coherence_states
 snoopMOESI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
+        uint64_t addr, int procNum);
+coherence_states
+cacheMESIF(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
+        uint64_t addr, int procNum);
+coherence_states
+snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState,
         uint64_t addr, int procNum);
 
 #endif
