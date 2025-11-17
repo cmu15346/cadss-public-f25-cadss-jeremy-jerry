@@ -648,6 +648,7 @@ snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState
         case MODIFIED:
             if (reqType == BUSRD) {
                 indicateShared(addr, procNum);
+                sendData(addr, procNum);
                 return SHARE;
             }
             else if (reqType == BUSWR) {
@@ -659,6 +660,7 @@ snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState
         case FORWARD:
             if (reqType == BUSRD) {
                 indicateShared(addr, procNum);
+                sendData(addr, procNum);
                 return SHARE;
             }
             else if (reqType == BUSWR) {
