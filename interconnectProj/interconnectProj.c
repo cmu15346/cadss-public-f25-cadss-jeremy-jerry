@@ -1,0 +1,459 @@
+#include <getopt.h>
+#include <stdio.h>
+
+#include <memory.h>
+#include <interconnect.h>
+
+typedef enum _bus_req_state
+{
+    NONE,
+    QUEUED,
+    TRANSFERING_CACHE,
+    TRANSFERING_MEMORY,
+    WAITING_CACHE,
+    WAITING_MEMORY
+} bus_req_state;
+
+typedef struct _bus_req {
+    bus_req_type brt;
+    bus_req_state currentState;
+    uint64_t addr;
+    int procNum;
+    uint8_t shared;
+    uint8_t data;
+    uint8_t dataAvail;
+    struct _bus_req* next;
+} bus_req;
+
+bus_req* pendingRequest = NULL;
+bus_req** queuedRequests;
+interconn* self;
+coher* coherComp;
+memory* memComp;
+
+int CADSS_VERBOSE = 0;
+int processorCount = 1;
+
+static const char* req_state_map[] = {
+    [NONE] = "None",
+    [QUEUED] = "Queued",
+    [TRANSFERING_CACHE] = "Cache-to-Cache Transfer",
+    [TRANSFERING_MEMORY] = "Memory Transfer",
+    [WAITING_CACHE] = "Waiting for Cache",
+    [WAITING_MEMORY] = "Waiting for Memory",
+};
+
+static const char* req_type_map[]
+    = {[NO_REQ] = "None", [BUSRD] = "BusRd",   [BUSWR] = "BusRdX",
+       [DATA] = "Data",   [SHARED] = "Shared", [MEMORY] = "Memory"};
+
+const int CACHE_DELAY = 10;
+const int CACHE_TRANSFER = 10;
+
+void registerCoher(coher* cc);
+void busReq(bus_req_type brt, uint64_t addr, int procNum);
+int busReqCacheTransfer(uint64_t addr, int procNum);
+void printInterconnState(void);
+void interconnNotifyState(void);
+
+// Topology: 0 = bus, 1 = line, 2 = ring, 3 = mesh, 4 = crossbar
+int8_t t = 0;
+
+// Packet information
+typedef struct _packet {
+    bus_req_type typ;   // type of packet (mem, busrd, etc.)
+    int pSrc;           // processor that sent message originally
+    int pDest;          // destination processor (not used if broadcast)
+    int msgNum;         // numerical ID of msg sent (or ID of msg being ACK'd)
+    bool broadcast;     // send to all other processors
+    bool ack;           // packet is an ACK packet
+    bool shared;        // indicates memory requested is shared
+    bool data;          // indicates packet is data
+    bool dataAvail;     // indicates data is available
+} packet;
+
+// Element of queue for a processor on a link
+typedef struct _link_req {
+    struct _link_req* next; // next message in queue
+    packet* pkt;            // packet information
+} link_req;
+
+// Link representing a connection between two nodes
+typedef struct _link {
+    int proc1;          // proc on link with lower ID
+    int proc2;          // proc on link with higher ID
+    int countdown;      // num ticks before reuse
+    link_req* queue1;   // queue for proc1's packets
+    link_req* queue2;   // queue for proc2's packets
+    bool p1Sent;        // used to alternate processor sending if both want to
+} link;
+
+// Message a processor is waiting for ACKs
+typedef struct _live_msg {
+    struct _live_msg* next; // next msg in linked list
+    packet* msg;            // info for packet that was sent
+    int numAcks;            // number of ACKs recv'd (needed for broadcast)
+}
+
+// Metadata needed for non-bus topologies
+link** links;            // array of links in the network (index is link)
+live_msg** live_msgs;    // array of live_msg linked lists (index is processor)
+
+/**
+ * 2D array of IDs of last msgs received
+ * First index by processor receiving messages, then by processor who sent
+ * Needed to prevent broadcast storms in networks with cycles
+ * Use for ring and mesh
+ *
+ * Alternatively, could do broadcast by plotting path through network
+ * Start and end with node that sent the broadcast
+ * Know all have received when broadcast reaches original sender
+ */
+int*** last_msgs;
+
+// Helper methods for per-processor request queues.
+static void enqBusRequest(bus_req* pr, int procNum)
+{
+    bus_req* iter;
+
+    // No items in the queue.
+    if (!queuedRequests[procNum])
+    {
+        queuedRequests[procNum] = pr;
+        return;
+    }
+
+    // Add request to the end of the queue.
+    iter = queuedRequests[procNum];
+    while (iter->next)
+    {
+        iter = iter->next;
+    }
+
+    pr->next = NULL;
+    iter->next = pr;
+}
+
+static bus_req* deqBusRequest(int procNum)
+{
+    bus_req* ret;
+
+    ret = queuedRequests[procNum];
+
+    // Move the head to the next request (if there is one).
+    if (ret)
+    {
+        queuedRequests[procNum] = ret->next;
+    }
+
+    return ret;
+}
+
+static int busRequestQueueSize(int procNum)
+{
+    int count = 0;
+    bus_req* iter;
+
+    if (!queuedRequests[procNum])
+    {
+        return 0;
+    }
+
+    iter = queuedRequests[procNum];
+    while (iter)
+    {
+        iter = iter->next;
+        count++;
+    }
+
+    return count;
+}
+
+interconn* init(inter_sim_args* isa)
+{
+    int op;
+
+    while ((op = getopt(isa->arg_count, isa->arg_list, "t:")) != -1)
+    {
+        switch (op)
+        {
+            // Topology
+            case 't':
+                t = atoi(optarg);
+
+            default:
+                break;
+        }
+    }
+
+    if (t == 0 || processorCount == 1) {
+        queuedRequests = malloc(sizeof(bus_req*) * processorCount);
+        for (int i = 0; i < processorCount; i++)
+        {
+            queuedRequests[i] = NULL;
+        }
+    }
+    if ((t == 1 && processorCount > 1) || (t > 1 && processorCount == 2)) {
+        // n-1 links for the line topology, each connect i and i+1
+        links = malloc(sizeof(link*) * (processorCount - 1));
+        for (int i = 0; i < processorCount - 1; i++) {
+            links[i] = malloc(sizeof(link));
+            links[i]->proc1 = i;
+            links[i]->proc2 = i+1;
+            links[i]->countdown = 0;
+            links[i]->queue1 = NULL;
+            links[i]->queue2 = NULL;
+            links[i]->p1Sent = false;
+        }
+        // no live messages yet, so each list is NULL
+        live_msgs = calloc(sizeof(live_msg*), processorCount);
+    }
+
+    self = malloc(sizeof(interconn));
+    self->busReq = busReq;
+    self->registerCoher = registerCoher;
+    self->busReqCacheTransfer = busReqCacheTransfer;
+    self->si.tick = tick;
+    self->si.finish = finish;
+    self->si.destroy = destroy;
+
+    memComp = isa->memory;
+    memComp->registerInterconnect(self);
+
+    return self;
+}
+
+int countDown = 0;
+int lastProc = 0; // for round robin arbitration
+
+void registerCoher(coher* cc)
+{
+    coherComp = cc;
+}
+
+void memReqCallback(int procNum, uint64_t addr)
+{
+    if (!pendingRequest)
+    {
+        return;
+    }
+
+    if (addr == pendingRequest->addr && procNum == pendingRequest->procNum)
+    {
+        pendingRequest->dataAvail = 1;
+    }
+}
+
+void busReq(bus_req_type brt, uint64_t addr, int procNum)
+{
+    if (pendingRequest == NULL)
+    {
+        assert(brt != SHARED);
+
+        bus_req* nextReq = calloc(1, sizeof(bus_req));
+        nextReq->brt = brt;
+        nextReq->currentState = WAITING_CACHE;
+        nextReq->addr = addr;
+        nextReq->procNum = procNum;
+        nextReq->dataAvail = 0;
+
+        pendingRequest = nextReq;
+        countDown = CACHE_DELAY;
+
+        return;
+    }
+    else if (brt == SHARED && pendingRequest->addr == addr)
+    {
+        pendingRequest->shared = 1;
+        return;
+    }
+    else if (brt == DATA && pendingRequest->addr == addr)
+    {
+        assert(pendingRequest->currentState == WAITING_MEMORY);
+        pendingRequest->data = 1;
+        pendingRequest->currentState = TRANSFERING_CACHE;
+        countDown = CACHE_TRANSFER;
+        return;
+    }
+    else
+    {
+        assert(brt != SHARED);
+
+        bus_req* nextReq = calloc(1, sizeof(bus_req));
+        nextReq->brt = brt;
+        nextReq->currentState = QUEUED;
+        nextReq->addr = addr;
+        nextReq->procNum = procNum;
+        nextReq->dataAvail = 0;
+
+        enqBusRequest(nextReq, procNum);
+    }
+}
+
+int tick()
+{
+    memComp->si.tick();
+
+    if (self->dbgEnv.cadssDbgWatchedComp && !self->dbgEnv.cadssDbgNotifyState)
+    {
+        printInterconnState();
+    }
+
+    if (countDown > 0)
+    {
+        assert(pendingRequest != NULL);
+        countDown--;
+
+        // If the count-down has elapsed (or there hasn't been a
+        // cache-to-cache transfer, the memory will respond with
+        // the data.
+        if (pendingRequest->dataAvail)
+        {
+            pendingRequest->currentState = TRANSFERING_MEMORY;
+            countDown = 0;
+        }
+
+        if (countDown == 0)
+        {
+            if (pendingRequest->currentState == WAITING_CACHE)
+            {
+                // Make a request to memory.
+                countDown
+                    = memComp->busReq(pendingRequest->addr,
+                                      pendingRequest->procNum, memReqCallback);
+
+                pendingRequest->currentState = WAITING_MEMORY;
+
+                // The processors will snoop for this request as well.
+                for (int i = 0; i < processorCount; i++)
+                {
+                    if (pendingRequest->procNum != i)
+                    {
+                        coherComp->busReq(pendingRequest->brt,
+                                          pendingRequest->addr, i);
+                    }
+                }
+
+                if (pendingRequest->data == 1)
+                {
+                    pendingRequest->brt = DATA;
+                }
+            }
+            else if (pendingRequest->currentState == TRANSFERING_MEMORY)
+            {
+                bus_req_type brt
+                    = (pendingRequest->shared == 1) ? SHARED : DATA;
+                coherComp->busReq(brt, pendingRequest->addr,
+                                  pendingRequest->procNum);
+
+                interconnNotifyState();
+                free(pendingRequest);
+                pendingRequest = NULL;
+            }
+            else if (pendingRequest->currentState == TRANSFERING_CACHE)
+            {
+                bus_req_type brt = pendingRequest->brt;
+                if (pendingRequest->shared == 1)
+                    brt = SHARED;
+
+                coherComp->busReq(brt, pendingRequest->addr,
+                                  pendingRequest->procNum);
+
+                interconnNotifyState();
+                free(pendingRequest);
+                pendingRequest = NULL;
+            }
+        }
+    }
+    else if (countDown == 0)
+    {
+        for (int i = 0; i < processorCount; i++)
+        {
+            int pos = (i + lastProc) % processorCount;
+            if (queuedRequests[pos] != NULL)
+            {
+                pendingRequest = deqBusRequest(pos);
+                countDown = CACHE_DELAY;
+                pendingRequest->currentState = WAITING_CACHE;
+
+                lastProc = (pos + 1) % processorCount;
+                break;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void printInterconnState(void)
+{
+    if (!pendingRequest)
+    {
+        return;
+    }
+
+    printf("--- Interconnect Debug State (Processors: %d) ---\n"
+           "       Current Request: \n"
+           "             Processor: %d\n"
+           "               Address: 0x%016lx\n"
+           "                  Type: %s\n"
+           "                 State: %s\n"
+           "         Shared / Data: %s\n"
+           "                  Next: %p\n"
+           "             Countdown: %d\n"
+           "    Request Queue Size: \n",
+           processorCount, pendingRequest->procNum, pendingRequest->addr,
+           req_type_map[pendingRequest->brt],
+           req_state_map[pendingRequest->currentState],
+           pendingRequest->shared ? "Shared" : "Data", pendingRequest->next,
+           countDown);
+
+    for (int p = 0; p < processorCount; p++)
+    {
+        printf("       - Processor[%02d]: %d\n", p, busRequestQueueSize(p));
+    }
+}
+
+void interconnNotifyState(void)
+{
+    if (!pendingRequest)
+        return;
+
+    if (self->dbgEnv.cadssDbgExternBreak)
+    {
+        printInterconnState();
+        raise(SIGTRAP);
+        return;
+    }
+
+    if (self->dbgEnv.cadssDbgWatchedComp && self->dbgEnv.cadssDbgNotifyState)
+    {
+        self->dbgEnv.cadssDbgNotifyState = 0;
+        printInterconnState();
+    }
+}
+
+// Return a non-zero value if the current request
+// was satisfied by a cache-to-cache transfer.
+int busReqCacheTransfer(uint64_t addr, int procNum)
+{
+    assert(pendingRequest);
+
+    if (addr == pendingRequest->addr && procNum == pendingRequest->procNum)
+        return (pendingRequest->currentState == TRANSFERING_CACHE);
+
+    return 0;
+}
+
+int finish(int outFd)
+{
+    memComp->si.finish(outFd);
+    return 0;
+}
+
+int destroy(void)
+{
+    // TODO
+    memComp->si.destroy();
+    return 0;
+}

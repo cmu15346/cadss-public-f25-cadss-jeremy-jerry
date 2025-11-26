@@ -21,5 +21,6 @@ add_subdirectory(memory)
 add_subdirectory(cacheSim)
 add_subdirectory(branchSim)
 add_subdirectory(simProcessor)
+add_subdirectory(interconnectProj)
 
 project(cadss C)
