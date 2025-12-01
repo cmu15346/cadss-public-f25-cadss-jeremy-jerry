@@ -1,6 +1,6 @@
 #include <getopt.h>
 #include <stdio.h>
-
+#include <stdbool.h>
 #include <memory.h>
 #include <interconnect.h>
 
@@ -67,45 +67,20 @@ int8_t t = 0;
 int64_t* perProcMsgCount;
 int64_t globalMsgCount = 0;
 
-// Packet information
-typedef struct _packet {
-    bus_req_type typ;   // type of packet (mem, busrd, etc.)
-    int pSrc;           // processor that sent message originally
-    int pDest;          // destination processor (not used if broadcast)
-    int msgNum;         // numerical ID of msg sent (or ID of msg being ACK'd)
-    bool broadcast;     // send to all other processors
-    bool ack;           // packet is an ACK packet
-    bool shared;        // indicates memory requested is shared
-    bool data;          // indicates packet is data
-    bool dataAvail;     // indicates data is available
-} packet;
-
-// Element of queue for a processor on a link
-typedef struct _link_req {
-    struct _link_req* next; // next message in queue
-    packet* pkt;            // packet information
-} link_req;
 
 // Link representing a connection between two nodes
 typedef struct _link {
     int proc1;          // proc on link with lower ID
     int proc2;          // proc on link with higher ID
-    int countdown;      // num ticks before reuse
+    int countDown;      // num ticks before reuse
     bus_req* pendingReq; // current request being sent on link
-    bus_req* linkQueue;
+    bus_req* linkQueue; // queue of requests waiting to use link
     bool p1Sent;        // used to alternate processor sending if both want to
 } link;
 
-// Message a processor is waiting for ACKs
-typedef struct _live_msg {
-    struct _live_msg* next; // next msg in linked list
-    packet* msg;            // info for packet that was sent
-    int numAcks;            // number of ACKs recv'd (needed for broadcast)
-}
 
 // Metadata needed for non-bus topologies
 link** links;            // array of links in the network (index is link)
-live_msg** live_msgs;    // array of live_msg linked lists (index is processor)
 
 /**
  * 2D array of IDs of last msgs received
@@ -267,13 +242,12 @@ interconn* init(inter_sim_args* isa)
             links[i] = malloc(sizeof(link));
             links[i]->proc1 = i;
             links[i]->proc2 = i+1;
-            links[i]->countdown = 0;
-            links[i]->queue1 = NULL;
-            links[i]->queue2 = NULL;
+            links[i]->countDown = 0;
+            links[i]->pendingReq = NULL;
+            links[i]->linkQueue = NULL;
             links[i]->p1Sent = false;
         }
         // no live messages yet, so each list is NULL
-        live_msgs = calloc(sizeof(live_msg*), processorCount);
         perProcMsgCount = calloc(sizeof(int64_t), processorCount);
         globalMsgCount = 0;
     }
@@ -418,7 +392,7 @@ bool forwardIfNeeded(bus_req* br, link* lnk) {
     if (br->msgNum <= perProcMsgCount[goingTo]) {
         //stale message, do not forward
         //this seems sketch, need to check again
-        return false;
+        return true;
     }
     if (goingTo == br->pDest) {
         perProcMsgCount[goingTo] = br->msgNum;
