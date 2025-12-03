@@ -420,7 +420,6 @@ link* findLink(int procNum, int pDest){
 }
 
 void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast, int msgNum) {
-    assert(procNum != processorCount);
     if (t == 0 || processorCount == 1) {
         if (brt == ACK) {
             //coher component should not be sending ACKs on bus topology
@@ -647,6 +646,9 @@ void lineTick() {
         if (lnk->countDown > 0)
         {
             lnk->countDown--;
+            if (lnk->pendingReq == NULL) {
+                continue;
+            }
             if (lnk->countDown == 0 && lnk->pendingReq->ack == false) {
                 bus_req* completedReq = lnk->pendingReq;
                 lnk->pendingReq = NULL;
@@ -667,6 +669,7 @@ void lineTick() {
                     assert(completedReq->procNum = processorCount - 1);
                     int memCountDown = memComp->busReq(completedReq->addr,
                                       completedReq->pSrc, memReqCallback);
+                    lnk->countDown = memCountDown;
                 }
                 free(completedReq);
 
