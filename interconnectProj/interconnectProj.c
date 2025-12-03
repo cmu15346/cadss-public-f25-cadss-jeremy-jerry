@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <memory.h>
 #include <interconnect.h>
+//TODO: interconnect does not send ack, coher will send ack with data/shared if needed
 
 typedef enum _bus_req_state
 {
@@ -28,14 +29,15 @@ typedef struct _bus_req {
     int msgNum;         // numerical ID of msg sent (or ID of msg being ACK'd)
     bool broadcast;     // send to all other processors
     bool ack;           // packet is an ACK packet
+    int numAcks;
 } bus_req;
 
 bus_req* pendingRequest = NULL;
-bus_req** lnkRequests;
-bus_req** queuedRequests;
-interconn* self;
+bus_req** activeRequests = NULL;
+bus_req** queuedRequests = NULL;
 coher* coherComp;
 memory* memComp;
+interconn* self = NULL;
 
 int CADSS_VERBOSE = 0;
 int processorCount = 1;
@@ -74,7 +76,8 @@ typedef struct _link {
     int proc2;          // proc on link with higher ID
     int countDown;      // num ticks before reuse
     bus_req* pendingReq; // current request being sent on link
-    bus_req* linkQueue; // queue of requests waiting to use link
+    bus_req* linkQueue1; // queue of requests waiting to use link, one for each processor
+    bus_req* linkQueue2;
     bool p1Sent;        // used to alternate processor sending if both want to
 } link;
 
@@ -156,16 +159,27 @@ static int busRequestQueueSize(int procNum)
 static void enqLinkRequest(bus_req* br, link* lnk)
 {
     bus_req* iter;
-
-    // No items in the queue.
-    if (!lnk->linkQueue)
-    {
-        lnk->linkQueue = br;
+    int procNum = br->procNum;
+    if (procNum != lnk->proc1 && procNum != lnk->proc2) {
+        printf("Error: trying to enqueue request from proc %d on link between %d and %d\n",
+               procNum, lnk->proc1, lnk->proc2);
         return;
     }
+    if (procNum == lnk->proc1) {
+        if (lnk->linkQueue1 == NULL) {
+            lnk->linkQueue1 = br;
+            return;
+        }
+        iter = lnk->linkQueue1;
+    }
+    else {
+        if (lnk->linkQueue2 == NULL) {
+            lnk->linkQueue2 = br;
+            return;
+        }
+        iter = lnk->linkQueue2;
+    }
 
-    // Add request to the end of the queue.
-    iter = lnk->linkQueue;
     while (iter->next)
     {
         iter = iter->next;
@@ -178,13 +192,47 @@ static void enqLinkRequest(bus_req* br, link* lnk)
 static bus_req* deqLinkRequest(link* lnk)
 {
     bus_req* ret;
-
-    ret = lnk->linkQueue;
-
-    // Move the head to the next request (if there is one).
-    if (ret)
-    {
-        lnk->linkQueue = ret->next;
+    if (lnk->p1Sent) {
+        //last time proc1 sent, so now proc2 gets to send if it has something
+        if (lnk->linkQueue2 == NULL) {
+            //nothing to send, so let proc1 send again
+            lnk->p1Sent = true;
+            ret = lnk->linkQueue1;
+            if (ret)
+            {
+                lnk->linkQueue1 = ret->next;
+            }
+        }
+        else {
+            //proc2 gets to send
+            lnk->p1Sent = false;
+            ret = lnk->linkQueue2;
+            if (ret)
+            {
+                lnk->linkQueue2 = ret->next;
+            }
+        }
+    }
+    else {
+        //last time proc2 sent, so now proc1 gets to send if it has something
+        if (lnk->linkQueue1 == NULL) {
+            //nothing to send, so let proc2 send again
+            lnk->p1Sent = false;
+            ret = lnk->linkQueue2;
+            if (ret)
+            {
+                lnk->linkQueue2 = ret->next;
+            }
+        }
+        else {
+            //proc1 gets to send
+            lnk->p1Sent = true;
+            ret = lnk->linkQueue1;
+            if (ret)
+            {
+                lnk->linkQueue1 = ret->next;
+            }
+        }
     }
 
     return ret;
@@ -195,12 +243,18 @@ static int linkRequestQueueSize(link* lnk)
     int count = 0;
     bus_req* iter;
 
-    if (!lnk->linkQueue)
+    if (!lnk->linkQueue1 && !lnk->linkQueue2)
     {
         return 0;
     }
 
-    iter = lnk->linkQueue;
+    iter = lnk->linkQueue1;
+    while (iter)
+    {
+        iter = iter->next;
+        count++;
+    }
+    iter = lnk->linkQueue2;
     while (iter)
     {
         iter = iter->next;
@@ -236,19 +290,20 @@ interconn* init(inter_sim_args* isa)
     }
     if ((t == 1 && processorCount > 1) || (t > 1 && processorCount == 2)) {
         // n-1 links for the line topology, each connect i and i+1
-        links = malloc(sizeof(link*) * (processorCount - 1));
-        lnkRequests = calloc(sizeof(bus_req*), (processorCount - 1));
-        for (int i = 0; i < processorCount - 1; i++) {
+        links = malloc(sizeof(link*) * processorCount);
+        for (int i = 0; i < processorCount; i++) {
             links[i] = malloc(sizeof(link));
             links[i]->proc1 = i;
             links[i]->proc2 = i+1;
             links[i]->countDown = 0;
             links[i]->pendingReq = NULL;
-            links[i]->linkQueue = NULL;
+            links[i]->linkQueue1 = NULL;
+            links[i]->linkQueue2 = NULL;
             links[i]->p1Sent = false;
         }
         // no live messages yet, so each list is NULL
         perProcMsgCount = calloc(sizeof(int64_t), processorCount);
+        activeRequests = calloc(sizeof(bus_req*), processorCount);
         globalMsgCount = 0;
     }
 
@@ -334,6 +389,7 @@ void busReq(bus_req_type brt, uint64_t addr, int procNum)
 }
 
 link* findLink(int procNum, int pDest){
+    assert(pDest != processorCount);
     if (t == 1) {
         //pDest is not necessarily next to procNum, so find correct link in the direction of pDest
         for (int i = 0; i < processorCount - 1; i++) {
@@ -347,10 +403,12 @@ link* findLink(int procNum, int pDest){
 }
 
 void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast) {
+    assert(procNum != processorCount);
     if (t == 0 || processorCount == 1) {
         busReq(brt, addr, procNum);
     }
     else if (t == 1 && processorCount > 1) {
+        //the processor should check the pending requests on its own link(s) and update if this req is related to those
         bus_req* nextReq = calloc(1, sizeof(bus_req));
         nextReq->brt = brt;
         nextReq->currentState = QUEUED;
@@ -379,7 +437,7 @@ void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast
     }
 }
 
-bool forwardIfNeeded(bus_req* br, link* lnk) {
+int forwardIfNeeded(bus_req* br, link* lnk) {
     int cameFrom = br->procNum;
     int goingTo;
     if (cameFrom == lnk->proc1) {
@@ -388,26 +446,27 @@ bool forwardIfNeeded(bus_req* br, link* lnk) {
     else {
         goingTo = lnk->proc1;
     }
-    //check of goingTo needs to pass on the message(add to queue of goingTo)
-    if (br->msgNum <= perProcMsgCount[goingTo]) {
-        //stale message, do not forward
-        //this seems sketch, need to check again
-        return true;
-    }
-    if (goingTo == br->pDest) {
-        perProcMsgCount[goingTo] = br->msgNum;
-        return false;
-    }
-    else {
-        //forward
-        perProcMsgCount[goingTo] = br->msgNum;
-        req(br->brt, br->addr, goingTo, br->pDest, br->broadcast);
-        //if broadcast, goinTo should still act, otherwise just forward and ignore
-        if (!br->broadcast) {
-            return true;
+    perProcMsgCount[goingTo] = br->msgNum;
+    bus_req* fwdReq = malloc(sizeof(bus_req));
+    memcpy(fwdReq, br, sizeof(bus_req));
+    fwdReq->procNum = goingTo;
+    link* nextLink = NULL;
+    for (int i = 0; i < processorCount - 1; i++) {
+        link* lnk2 = links[i];
+        if ((goingTo == lnk2->proc1 && cameFrom != lnk2->proc2) ||
+            (goingTo == lnk2->proc2 && cameFrom != lnk2->proc1)) {
+            nextLink = lnk2;
+            break;
         }
-        return false;
     }
+    if (nextLink != NULL) {
+        enqLinkRequest(fwdReq, nextLink);
+    }
+    //if broadcast, goinTo should still act, otherwise just forward and ignore
+    if (!br->broadcast) {
+        return -1;
+    }
+    return goingTo;
 }
 
 void busTick() {
@@ -496,95 +555,121 @@ void busTick() {
 }
 
 void lineTick() {
-    for (int i = 0; i < processorCount - 1; i++) {
+    for (int i = 0; i < processorCount; i++) {
         link* lnk = links[i];
         if (lnk->countDown > 0)
-            {
+        {
             lnk->countDown--;
+            if (lnk->countDown == 0 && lnk->pendingReq->ack == false) {
+                bus_req* completedReq = lnk->pendingReq;
+                int goingTo = forwardIfNeeded(completedReq, lnk);
+                assert(goingTo != completedReq->procNum);
+                assert(goingTo == lnk->proc1 || goingTo == lnk->proc2);
+                if (goingTo != -1 && goingTo < processorCount) {
+                    //if not just forwarding, have the coher component process it
+                    coherComp->busReq(completedReq->brt, completedReq->addr,
+                                      goingTo);
+                    //send ack
+                    bus_req* ackReq = malloc(sizeof(bus_req));
+                    memcpy(ackReq, completedReq, sizeof(bus_req));
+                    ackReq->ack = true;
+                    ackReq->pDest = completedReq->pSrc;
+                    ackReq->pSrc = goingTo;
+                    ackReq->procNum = goingTo;
+                    ackReq->broadcast = false;
+                    enqLinkRequest(ackReq, lnk);
+                }
+                else if (goingTo != -1 && goingTo == processorCount) {
+                    //going to memory
+                    int memCountDown = memComp->busReq(completedReq->addr,
+                                      completedReq->pSrc, memReqCallback);
+                }
+                free(completedReq);
 
-            // If the count-down has elapsed (or there hasn't been a
-            // cache-to-cache transfer, the memory will respond with
-            // the data.
-            if (lnk->pendingReq->dataAvail)
-            {
-                pendingRequest->currentState = TRANSFERING_MEMORY;
-                lnk->countDown = 0;
             }
-
-            if (lnk->countDown == 0)
-            {
-                if (lnk->pendingReq->currentState == WAITING_CACHE && 
-                    lnk->pendingReq->pSrc == lnk->pendingReq->procNum)
-                {
-                    // Make a request to memory.
-                    lnk->countDown
-                        = memComp->busReq(lnk->pendingReq->addr,
-                                        lnk->pendingReq->procNum, memReqCallback);
-
-                    lnk->pendingReq->currentState = WAITING_MEMORY;
-
-                    assert(lnk->pendingReq->procNum == lnk->proc1
-                        || lnk->pendingReq->procNum == lnk->proc2);
-
-                    if (lnk->pendingReq->procNum == lnk->proc2)
-                    {
-                        coherComp->busReq(lnk->pendingReq->brt,
-                                        lnk->pendingReq->addr, lnk->proc1);
+            if (lnk->countDown == 0 && lnk->pendingReq->ack == true) {
+                bus_req* completedReq = lnk->pendingReq;
+                assert(completedReq->pDest < processorCount); //no acks to memory
+                int goingTo = forwardIfNeeded(completedReq, lnk);
+                assert(goingTo != completedReq->procNum);
+                assert(goingTo == lnk->proc1 || goingTo == lnk->proc2);
+                assert(completedReq->broadcast == false);
+                if (goingTo == completedReq->pDest) {
+                    //ack reached destination
+                    bus_req* prev = NULL;
+                    bus_req* iter = activeRequests[completedReq->pDest];
+                    assert(iter != NULL);
+                    if (iter->msgNum == completedReq->msgNum) {
+                        //first in chain
+                        activeRequests[completedReq->pDest] = iter->next;
                     }
-                    if (lnk->pendingReq->procNum == lnk->proc1)
-                    {
-                        coherComp->busReq(lnk->pendingReq->brt,
-                                        lnk->pendingReq->addr, lnk->proc2);
+                    else {
+                        //find in chain
+                        prev = iter;
+                        iter = iter->next;
+                        assert(iter != NULL);
+                        while (iter->msgNum != completedReq->msgNum) {
+                            prev = iter;
+                            iter = iter->next;
+                            assert(iter != NULL);
+                        }
+                    }
+                    if (iter->broadcast) {
+                        //if broadcast, need to wait for acks from all processors
+                        iter->numAcks++;
+                        assert(iter->numAcks <= processorCount - 1);
+                        if (iter->numAcks == processorCount - 1) {
+                            //all acks received, remove from active requests
+                            if (prev != NULL) {
+                                prev->next = iter->next;
+                            }
+                            else {
+                                activeRequests[completedReq->pDest] = iter->next;
+                            }
+                            //TODO: signal completion to processor
+                            free(iter);
+                        }
+                    }
+                    else {
+                        //not broadcast, so just remove from active requests
+                        if (prev != NULL) {
+                            prev->next = iter->next;
+                        }
+                        else {
+                            activeRequests[completedReq->pDest] = iter->next;
+                        }
+                        //TODO: signal completion to processor
+                        free(iter);
                     }
 
-                    if (lnk->pendingReq->data == 1)
-                    {
-                        lnk->pendingReq->brt = DATA;
-                    }
-                }
-                else if (lnk->pendingReq->currentState == TRANSFERING_MEMORY)
-                {
-                    bus_req_type brt
-                        = (lnk->pendingReq->shared == 1) ? SHARED : DATA;
-                    coherComp->busReq(brt, lnk->pendingReq->addr,
-                                    lnk->pendingReq->procNum);
-
-                    interconnNotifyState();
-                    bus_req* temp = lnk->pendingReq;
-                    lnk->pendingReq = lnk->pendingReq->next;
-                    free(temp);
-                }
-                else if (lnk->pendingReq->currentState == TRANSFERING_CACHE)
-                {
-                    bus_req_type brt = lnk->pendingReq->brt;
-                    if (lnk->pendingReq->shared == 1)
-                        brt = SHARED;
-
-                    coherComp->busReq(brt, lnk->pendingReq->addr,
-                                    lnk->pendingReq->procNum);
-
-                    interconnNotifyState();
-                    bus_req* temp = lnk->pendingReq;
-                    lnk->pendingReq = lnk->pendingReq->next;
-                    free(temp);
                 }
             }
         }
         else if (lnk->countDown == 0)
         {
-            if (lnk->linkQueue == NULL) {
+            if (linkRequestQueueSize(lnk) == 0) {
                 continue;
             }
             bus_req* nextReq = deqLinkRequest(lnk);
-            if (forwardIfNeeded(nextReq, lnk)) {
-                //just forward, no need to act, so free
-                free(nextReq);
+            lnk->pendingReq = deqLinkRequest(lnk);
+            if (lnk->pendingReq->procNum == lnk->pendingReq->pSrc) {
+                bus_req* copy = malloc(sizeof(bus_req));
+                memcpy(copy, lnk->pendingReq, sizeof(bus_req));
+                copy->numAcks = 0;
+                if (activeRequests[lnk->pendingReq->pSrc] == NULL) {
+                    activeRequests[lnk->pendingReq->pSrc] = copy;
+                }
+                else {
+                    //there is already an active request from this processor, so chain it
+                    bus_req* iter = activeRequests[lnk->pendingReq->pSrc];
+                    while (iter->next != NULL) {
+                        iter = iter->next;
+                    }
+                    iter->next = copy;
+                }
             }
-            else {
-                lnk->pendingReq = deqLinkRequest(lnk);
-                lnk->countDown = CACHE_DELAY;
-                lnk->pendingReq->currentState = WAITING_CACHE;
-            }
+            lnk->countDown = CACHE_DELAY;
+            lnk->pendingReq->currentState = WAITING_CACHE;
         } 
     }
 }
