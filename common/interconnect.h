@@ -1,5 +1,7 @@
 #ifndef INTERCONNECT_H
 #define INTERCONNECT_H
+#include <stdint.h>
+#include <stdbool.h>
 
 struct _coher;
 struct _memory;
@@ -11,7 +13,9 @@ typedef enum _bus_req_type
     BUSWR,
     DATA,
     SHARED,
-    MEMORY
+    MEMORY,
+    ACK,
+    SHARED_DATA
 } bus_req_type;
 
 #include "coherence.h"
@@ -26,7 +30,7 @@ typedef struct _inter_sim_args {
 
 typedef struct _interconn {
     sim_interface si;
-    void (*busReq)(bus_req_type brt, uint64_t addr, int procNum);
+    void (*req)(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast, int msgNum);
     void (*registerCoher)(struct _coher* coherComp);
     int (*busReqCacheTransfer)(uint64_t addr, int procNum);
     debug_env_vars dbgEnv;

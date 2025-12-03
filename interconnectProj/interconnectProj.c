@@ -53,16 +53,19 @@ static const char* req_state_map[] = {
 
 static const char* req_type_map[]
     = {[NO_REQ] = "None", [BUSRD] = "BusRd",   [BUSWR] = "BusRdX",
-       [DATA] = "Data",   [SHARED] = "Shared", [MEMORY] = "Memory"};
+       [DATA] = "Data",   [SHARED] = "Shared", [MEMORY] = "Memory", [ACK] = "Ack",
+       [SHARED_DATA] = "Shared Data"};
 
 const int CACHE_DELAY = 10;
 const int CACHE_TRANSFER = 10;
 
 void registerCoher(coher* cc);
 void busReq(bus_req_type brt, uint64_t addr, int procNum);
+void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast, int msgNum);
 int busReqCacheTransfer(uint64_t addr, int procNum);
 void printInterconnState(void);
 void interconnNotifyState(void);
+void printInterconnForLineState(void);
 
 // Topology: 0 = bus, 1 = line, 2 = ring, 3 = mesh, 4 = crossbar
 int8_t t = 0;
@@ -156,8 +159,14 @@ static int busRequestQueueSize(int procNum)
 }
 
 //helpers for link queues
-static void enqLinkRequest(bus_req* br, link* lnk)
+static void enqLinkRequest(bus_req* r, link* lnk)
 {
+    bus_req* br = malloc(sizeof(bus_req));
+    memcpy(br, r, sizeof(bus_req));
+    if (CADSS_VERBOSE) {
+        printf("Enqueuing request from proc %d of type %s on link between proc %d and proc %d\n",
+               br->procNum, req_type_map[br->brt], lnk->proc1, lnk->proc2);
+    } 
     bus_req* iter;
     int procNum = br->procNum;
     if (procNum != lnk->proc1 && procNum != lnk->proc2) {
@@ -234,7 +243,7 @@ static bus_req* deqLinkRequest(link* lnk)
             }
         }
     }
-
+    ret->next = NULL;
     return ret;
 }
 
@@ -245,6 +254,10 @@ static int linkRequestQueueSize(link* lnk)
 
     if (!lnk->linkQueue1 && !lnk->linkQueue2)
     {
+        // if (CADSS_VERBOSE) {
+        //     printf("Link between proc %d and proc %d has 0 queued requests\n",
+        //            lnk->proc1, lnk->proc2);
+        // }
         return 0;
     }
 
@@ -308,7 +321,7 @@ interconn* init(inter_sim_args* isa)
     }
 
     self = malloc(sizeof(interconn));
-    self->busReq = busReq;
+    self->req = req;
     self->registerCoher = registerCoher;
     self->busReqCacheTransfer = busReqCacheTransfer;
     self->si.tick = tick;
@@ -331,14 +344,19 @@ void registerCoher(coher* cc)
 
 void memReqCallback(int procNum, uint64_t addr)
 {
-    if (!pendingRequest)
-    {
-        return;
-    }
+    if (t == 0 || processorCount == 1) {
+        if (!pendingRequest)
+        {
+            return;
+        }
 
-    if (addr == pendingRequest->addr && procNum == pendingRequest->procNum)
-    {
-        pendingRequest->dataAvail = 1;
+        if (addr == pendingRequest->addr && procNum == pendingRequest->procNum)
+        {
+            pendingRequest->dataAvail = 1;
+        }
+    }
+    else if (t == 1 && processorCount > 1) {
+        req(DATA, addr, processorCount, procNum, false, -2);
     }
 }
 
@@ -389,10 +407,9 @@ void busReq(bus_req_type brt, uint64_t addr, int procNum)
 }
 
 link* findLink(int procNum, int pDest){
-    assert(pDest != processorCount);
     if (t == 1) {
         //pDest is not necessarily next to procNum, so find correct link in the direction of pDest
-        for (int i = 0; i < processorCount - 1; i++) {
+        for (int i = 0; i < processorCount; i++) {
             link* lnk = links[i];
             if ((procNum == lnk->proc1 && pDest >= lnk->proc2) ||
                 (procNum == lnk->proc2 && pDest <= lnk->proc1)) {
@@ -402,13 +419,30 @@ link* findLink(int procNum, int pDest){
     }
 }
 
-void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast) {
+void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast, int msgNum) {
     assert(procNum != processorCount);
     if (t == 0 || processorCount == 1) {
+        if (brt == ACK) {
+            //coher component should not be sending ACKs on bus topology
+            return;
+        }
         busReq(brt, addr, procNum);
     }
     else if (t == 1 && processorCount > 1) {
         //the processor should check the pending requests on its own link(s) and update if this req is related to those
+        if (CADSS_VERBOSE) {
+            printf("Processor %d requesting %s for address %lx via %s to proc %d\n",
+                   procNum, req_type_map[brt], addr,
+                   (broadcast) ? "broadcast" : "unicast", pDest);
+        }
+        int numToUse;
+        if (brt == BUSRD || brt == BUSWR) {
+            globalMsgCount++;
+            numToUse = globalMsgCount;
+        }
+        else {
+            numToUse = msgNum;
+        }
         bus_req* nextReq = calloc(1, sizeof(bus_req));
         nextReq->brt = brt;
         nextReq->currentState = QUEUED;
@@ -418,9 +452,24 @@ void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast
         nextReq->pSrc = procNum;
         nextReq->pDest = pDest;
         nextReq->broadcast = broadcast;
-        nextReq->msgNum = globalMsgCount++; //msgCount increment
+        nextReq->msgNum = numToUse;
+        if (brt == ACK || brt == DATA || brt == SHARED || brt == SHARED_DATA) {
+            //ACKs should not be broadcast
+            nextReq->broadcast = false;
+            if (procNum != processorCount) {
+                nextReq->ack = true;
+            }
+        }
+        else {
+            nextReq->ack = false;
+        }
+        if (brt == DATA || brt == SHARED_DATA) {
+            nextReq->data = 1;
+        }
 
         if (broadcast) {
+            assert(brt != ACK); //ACKs should not be broadcast
+            assert(brt != MEMORY); //memory requests should not be broadcast
             //send both ways so add to queue of both links
             for (int i = 0; i < processorCount - 1; i++) {
                 link* lnk = links[i];
@@ -434,6 +483,7 @@ void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast
             link* lnk = findLink(procNum, pDest);
             enqLinkRequest(nextReq, lnk);
         }
+        free(nextReq);
     }
 }
 
@@ -446,12 +496,25 @@ int forwardIfNeeded(bus_req* br, link* lnk) {
     else {
         goingTo = lnk->proc1;
     }
+    if (CADSS_VERBOSE) {
+        //print source and dest of request
+        printf("Request is of type %s for address %lx from proc %d to proc %d (broadcast: %s)\n",
+               req_type_map[br->brt], br->addr, br->pSrc, br->pDest,
+               (br->broadcast) ? "true" : "false");
+        //print cameFrom/goingTo
+        printf("Came from proc %d, going to proc %d\n", cameFrom, goingTo);
+        //print link info
+        printf("Link between proc %d and proc %d\n", lnk->proc1, lnk->proc2);
+    }
     perProcMsgCount[goingTo] = br->msgNum;
     bus_req* fwdReq = malloc(sizeof(bus_req));
     memcpy(fwdReq, br, sizeof(bus_req));
     fwdReq->procNum = goingTo;
     link* nextLink = NULL;
-    for (int i = 0; i < processorCount - 1; i++) {
+    for (int i = 0; i < processorCount; i++) {
+        if (i == processorCount - 1 && br->brt != MEMORY) {
+            break;
+        }
         link* lnk2 = links[i];
         if ((goingTo == lnk2->proc1 && cameFrom != lnk2->proc2) ||
             (goingTo == lnk2->proc2 && cameFrom != lnk2->proc1)) {
@@ -461,9 +524,11 @@ int forwardIfNeeded(bus_req* br, link* lnk) {
     }
     if (nextLink != NULL) {
         enqLinkRequest(fwdReq, nextLink);
+        free(fwdReq);
     }
     //if broadcast, goinTo should still act, otherwise just forward and ignore
-    if (!br->broadcast) {
+    if (!br->broadcast && nextLink != NULL) {
+        //not broadcast and we are also not the destination, so dont act on it
         return -1;
     }
     return goingTo;
@@ -501,7 +566,7 @@ void busTick() {
                     if (pendingRequest->procNum != i)
                     {
                         coherComp->busReq(pendingRequest->brt,
-                                          pendingRequest->addr, i);
+                                          pendingRequest->addr, i, -1, -1);
                     }
                 }
 
@@ -515,7 +580,7 @@ void busTick() {
                 bus_req_type brt
                     = (pendingRequest->shared == 1) ? SHARED : DATA;
                 coherComp->busReq(brt, pendingRequest->addr,
-                                  pendingRequest->procNum);
+                                  pendingRequest->procNum, -1, -1);
 
                 interconnNotifyState();
                 free(pendingRequest);
@@ -528,7 +593,7 @@ void busTick() {
                     brt = SHARED;
 
                 coherComp->busReq(brt, pendingRequest->addr,
-                                  pendingRequest->procNum);
+                                  pendingRequest->procNum, -1, -1);
 
                 interconnNotifyState();
                 free(pendingRequest);
@@ -554,7 +619,29 @@ void busTick() {
     }
 }
 
+bool checkActiveRequests() {
+    for (int i = 0; i < processorCount; i++) {
+        //no duplicates should be in active requests
+        bus_req* iter = activeRequests[i];
+        while (iter != NULL) {
+            bus_req* iter2 = iter->next;
+            while (iter2 != NULL) {
+                if (iter->msgNum == iter2->msgNum) {
+                    printInterconnForLineState();
+                    return false;   
+                }
+                iter2 = iter2->next;
+            }
+            iter = iter->next;
+        }
+    }
+    return true;
+}
+
+int tickCount = 0;
+int lastProgressTick = 0;
 void lineTick() {
+    tickCount++;
     for (int i = 0; i < processorCount; i++) {
         link* lnk = links[i];
         if (lnk->countDown > 0)
@@ -562,48 +649,49 @@ void lineTick() {
             lnk->countDown--;
             if (lnk->countDown == 0 && lnk->pendingReq->ack == false) {
                 bus_req* completedReq = lnk->pendingReq;
+                lnk->pendingReq = NULL;
                 int goingTo = forwardIfNeeded(completedReq, lnk);
                 assert(goingTo != completedReq->procNum);
-                assert(goingTo == lnk->proc1 || goingTo == lnk->proc2);
+                assert(goingTo == lnk->proc1 || goingTo == lnk->proc2 || goingTo == -1);
+                assert(goingTo == completedReq->pDest || goingTo == -1 ||
+                       completedReq->broadcast == true);
                 if (goingTo != -1 && goingTo < processorCount) {
                     //if not just forwarding, have the coher component process it
                     coherComp->busReq(completedReq->brt, completedReq->addr,
-                                      goingTo);
-                    //send ack
-                    bus_req* ackReq = malloc(sizeof(bus_req));
-                    memcpy(ackReq, completedReq, sizeof(bus_req));
-                    ackReq->ack = true;
-                    ackReq->pDest = completedReq->pSrc;
-                    ackReq->pSrc = goingTo;
-                    ackReq->procNum = goingTo;
-                    ackReq->broadcast = false;
-                    enqLinkRequest(ackReq, lnk);
+                                      goingTo, completedReq->pSrc, completedReq->msgNum);
                 }
-                else if (goingTo != -1 && goingTo == processorCount) {
-                    //going to memory
+                else if (goingTo == processorCount) {
+                    assert(completedReq->brt == MEMORY);
+                    assert(completedReq->broadcast == false);
+                    assert(completedReq->pDest == processorCount);
+                    assert(completedReq->procNum = processorCount - 1);
                     int memCountDown = memComp->busReq(completedReq->addr,
                                       completedReq->pSrc, memReqCallback);
                 }
                 free(completedReq);
 
             }
-            if (lnk->countDown == 0 && lnk->pendingReq->ack == true) {
+            else if (lnk->countDown == 0 && lnk->pendingReq->ack == true) {
                 bus_req* completedReq = lnk->pendingReq;
+                lnk->pendingReq = NULL;
                 assert(completedReq->pDest < processorCount); //no acks to memory
                 int goingTo = forwardIfNeeded(completedReq, lnk);
                 assert(goingTo != completedReq->procNum);
-                assert(goingTo == lnk->proc1 || goingTo == lnk->proc2);
+                assert(goingTo == lnk->proc1 || goingTo == lnk->proc2 || goingTo == -1);
                 assert(completedReq->broadcast == false);
                 if (goingTo == completedReq->pDest) {
                     //ack reached destination
+                    if (CADSS_VERBOSE) {
+                        printf("ACK for msg %d reached destination proc %d\n",
+                               completedReq->msgNum, completedReq->pDest);
+                    }
                     bus_req* prev = NULL;
                     bus_req* iter = activeRequests[completedReq->pDest];
-                    assert(iter != NULL);
-                    if (iter->msgNum == completedReq->msgNum) {
-                        //first in chain
-                        activeRequests[completedReq->pDest] = iter->next;
+                    if (iter == NULL) {
+                        printInterconnForLineState();
                     }
-                    else {
+                    assert(iter != NULL);
+                    if (iter->msgNum != completedReq->msgNum) {
                         //find in chain
                         prev = iter;
                         iter = iter->next;
@@ -611,6 +699,9 @@ void lineTick() {
                         while (iter->msgNum != completedReq->msgNum) {
                             prev = iter;
                             iter = iter->next;
+                            if (iter == NULL) {
+                                printInterconnForLineState();
+                            }
                             assert(iter != NULL);
                         }
                     }
@@ -618,19 +709,48 @@ void lineTick() {
                         //if broadcast, need to wait for acks from all processors
                         iter->numAcks++;
                         assert(iter->numAcks <= processorCount - 1);
+                        if (completedReq->brt == SHARED_DATA || completedReq->brt == DATA) {
+                            //data/shared ack, so mark data as available
+                            iter->dataAvail = 1;
+                        }
+                        if (completedReq->brt == SHARED_DATA || completedReq->brt == SHARED) {
+                            //shared data ack, so mark shared as true
+                            iter->shared = 1;
+                        }
                         if (iter->numAcks == processorCount - 1) {
                             //all acks received, remove from active requests
+                            if (CADSS_VERBOSE) {
+                                printf("All ACKs for broadcast msg %d received at proc %d\n",
+                                       completedReq->msgNum, completedReq->pDest);
+                            }
                             if (prev != NULL) {
+                                assert(prev->next == iter);
                                 prev->next = iter->next;
                             }
                             else {
                                 activeRequests[completedReq->pDest] = iter->next;
                             }
-                            //TODO: signal completion to processor
+                            if (!iter->dataAvail) {
+                                req(MEMORY, iter->addr, iter->pSrc, processorCount, false, -2);
+                            }
+                            else {
+                                if (iter->shared) {
+                                    //data is shared
+                                    coherComp->busReq(SHARED, iter->addr,
+                                                      iter->pSrc, -1, -2);
+                                }
+                                else {
+                                    //data is exclusive
+                                    coherComp->busReq(DATA, iter->addr,
+                                                      iter->pSrc, -1, -2);
+                                }
+                            }
                             free(iter);
                         }
                     }
                     else {
+                        perror("should not be here with no directory\n");
+                        exit(1);
                         //not broadcast, so just remove from active requests
                         if (prev != NULL) {
                             prev->next = iter->next;
@@ -641,8 +761,8 @@ void lineTick() {
                         //TODO: signal completion to processor
                         free(iter);
                     }
-
                 }
+                assert(checkActiveRequests());
             }
         }
         else if (lnk->countDown == 0)
@@ -650,9 +770,21 @@ void lineTick() {
             if (linkRequestQueueSize(lnk) == 0) {
                 continue;
             }
+            lastProgressTick = tickCount;
             bus_req* nextReq = deqLinkRequest(lnk);
-            lnk->pendingReq = deqLinkRequest(lnk);
-            if (lnk->pendingReq->procNum == lnk->pendingReq->pSrc) {
+            lnk->pendingReq = nextReq;
+            if (lnk->pendingReq->procNum == lnk->pendingReq->pSrc &&
+                lnk->pendingReq->ack == false &&
+                (lnk->pendingReq->brt == BUSRD || lnk->pendingReq->brt == BUSWR)) {
+                //print we are waiting for acks for msg with msgnum:
+                if (CADSS_VERBOSE) {
+                    printf("Tracking active request from proc %d of type %s for address %lx with msgNum %d\n",
+                           lnk->pendingReq->pSrc,
+                           req_type_map[lnk->pendingReq->brt],
+                           lnk->pendingReq->addr,
+                           lnk->pendingReq->msgNum);
+                }
+                assert(lnk->pendingReq->broadcast == true);
                 bus_req* copy = malloc(sizeof(bus_req));
                 memcpy(copy, lnk->pendingReq, sizeof(bus_req));
                 copy->numAcks = 0;
@@ -662,15 +794,36 @@ void lineTick() {
                 else {
                     //there is already an active request from this processor, so chain it
                     bus_req* iter = activeRequests[lnk->pendingReq->pSrc];
-                    while (iter->next != NULL) {
+                    bool shouldAdd = true;
+                    while (iter!= NULL) {
+                        if (iter->msgNum == copy->msgNum) {
+                            //already tracking this request
+                            shouldAdd = false;
+                            free(copy);
+                            break;
+                        }
                         iter = iter->next;
                     }
-                    iter->next = copy;
+                    if (shouldAdd) {
+                        iter->next = copy;
+                    }
                 }
+                assert(checkActiveRequests());
+            }
+            if (CADSS_VERBOSE) {
+                printf("Link between proc %d and proc %d sending req from proc %d of type %s to proc %d\n",
+                       lnk->proc1, lnk->proc2, lnk->pendingReq->pSrc,
+                       req_type_map[lnk->pendingReq->brt],
+                       (lnk->pendingReq->broadcast) ? -1 : lnk->pendingReq->pDest);
             }
             lnk->countDown = CACHE_DELAY;
             lnk->pendingReq->currentState = WAITING_CACHE;
         } 
+    }
+    if (tickCount - lastProgressTick > 1000) {
+        printf("No progress made in 1000 ticks, possible deadlock in interconnect\n");
+        printInterconnForLineState();
+        raise(SIGTRAP);
     }
 }
 
@@ -688,11 +841,68 @@ int tick()
     }
 
     if (t == 1 && processorCount > 1) {
-        // Line topology tick
-        // TODO
+        lineTick();
     }
     
     return 0;
+}
+
+void printInterconnForLineState(void)
+{
+    printf("--- Interconnect Debug State for Line Topology (Processors: %d) ---\n",
+           processorCount);
+    for (int i = 0; i < processorCount; i++) {
+        link* lnk = links[i];
+        printf("Link between proc %d and proc %d:\n", lnk->proc1, lnk->proc2);
+        if (lnk->pendingReq != NULL) {
+            printf("  Pending Request:\n"
+                   "    From Proc: %d\n"
+                   "    Type: %s\n"
+                   "    Address: 0x%016lx\n"
+                   "    State: %s\n"
+                   "    Broadcast: %s\n"
+                   "    Ack: %s\n"
+                   "msgNum: %d\n",
+                   lnk->pendingReq->procNum,
+                   req_type_map[lnk->pendingReq->brt],
+                   lnk->pendingReq->addr,
+                   req_state_map[lnk->pendingReq->currentState],
+                   (lnk->pendingReq->broadcast) ? "true" : "false",
+                   (lnk->pendingReq->ack) ? "true" : "false",
+                   lnk->pendingReq->msgNum);
+        } else {
+            printf("  No Pending Request\n");
+        }
+        printf("  Link Queue Size: %d\n", linkRequestQueueSize(lnk));
+    }
+    // Print active requests per processor
+    for (int p = 0; p < processorCount; p++)
+    {
+        printf("  Active Requests for Processor[%02d]:\n", p);
+        bus_req* iter = activeRequests[p];
+        if (iter == NULL) {
+            printf("    None\n");
+        }
+        while (iter)
+        {
+            printf("    Request:\n"
+                   "      Type: %s\n"
+                   "      Address: 0x%016lx\n"
+                   "      Broadcast: %s\n"
+                   "      Ack: %s\n"
+                   "      Num Acks Received: %d\n"
+                   "      MsgNum: %d\n"
+                   "      source Proc: %d\n",
+                   req_type_map[iter->brt],
+                   iter->addr,
+                   (iter->broadcast) ? "true" : "false",
+                   (iter->ack) ? "true" : "false",
+                   iter->numAcks,
+                   iter->msgNum,
+                   iter->pSrc);
+            iter = iter->next;
+        }
+    }
 }
 
 void printInterconnState(void)
@@ -747,7 +957,38 @@ void interconnNotifyState(void)
 // was satisfied by a cache-to-cache transfer.
 int busReqCacheTransfer(uint64_t addr, int procNum)
 {
-    assert(pendingRequest);
+    //check every link's pending request and queue to see if any node that is not memory is transferring data for this addr and procNum
+    for (int i = 0; i < processorCount; i++) {
+        link* lnk = links[i];
+        if (lnk->pendingReq != NULL) {
+            if (lnk->pendingReq->addr == addr &&
+                lnk->pendingReq->procNum == procNum &&
+                lnk->pendingReq->data == 1) {
+                return 1;
+            }
+        }
+        bus_req* iter = lnk->linkQueue1;
+        while (iter != NULL) {
+            if (iter->addr == addr &&
+                iter->procNum == procNum &&
+                iter->data == 1) {
+                return 1;
+            }
+            iter = iter->next;
+        }
+        iter = lnk->linkQueue2;
+        while (iter != NULL) {
+            if (iter->addr == addr &&
+                iter->procNum == procNum &&
+                iter->data == 1) {
+                return 1;
+            }
+            iter = iter->next;
+        }
+    }
+
+    if (!pendingRequest)
+        return 0;
 
     if (addr == pendingRequest->addr && procNum == pendingRequest->procNum)
         return (pendingRequest->currentState == TRANSFERING_CACHE);

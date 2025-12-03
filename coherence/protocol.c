@@ -2,28 +2,54 @@
 
 void sendBusRd(uint64_t addr, int procNum)
 {
-    inter_sim->busReq(BUSRD, addr, procNum);
+    if (CADSS_VERBOSE) {
+        printf("Processor %d sending BUSRD for address %lx\n", procNum, addr);
+    }
+    inter_sim->req(BUSRD, addr, procNum, -1, true, -1);
 }
 
 void sendBusWr(uint64_t addr, int procNum)
 {
-    inter_sim->busReq(BUSWR, addr, procNum);
+    if (CADSS_VERBOSE) {
+        printf("Processor %d sending BUSWR for address %lx\n", procNum, addr);
+    }
+    inter_sim->req(BUSWR, addr, procNum, -1, true, -1);
 }
 
-void sendData(uint64_t addr, int procNum)
+void sendData(uint64_t addr, int procNum, int pDest, int msgNum)
 {
     if (CADSS_VERBOSE) {
         printf("Processor %d sending DATA for address %lx\n", procNum, addr);
     }
-    inter_sim->busReq(DATA, addr, procNum);
+    inter_sim->req(DATA, addr, procNum, pDest, false, msgNum);
 }
 
-void indicateShared(uint64_t addr, int procNum)
+void indicateShared(uint64_t addr, int procNum, int pDest, int msgNum)
 {
     if (CADSS_VERBOSE) {
         printf("Processor %d indicating SHARED for address %lx\n", procNum, addr);
     }
-    inter_sim->busReq(SHARED, addr, procNum);
+    inter_sim->req(SHARED, addr, procNum, pDest, false, msgNum);
+}
+
+void ack(uint64_t addr, int procNum, int pDest, bus_req_type reqType, int msgNum)
+{
+    if (reqType != BUSRD && reqType != BUSWR) {
+        // Only send ACKs for BusRd and BusWr requests
+        return;
+    }
+    if (CADSS_VERBOSE) {
+        printf("Processor %d sending ACK for address %lx\n", procNum, addr);
+    }
+    inter_sim->req(ACK, addr, procNum, pDest, false, msgNum);
+}
+
+void shareData(uint64_t addr, int procNum, int pDest, int msgNum)
+{
+    if (CADSS_VERBOSE) {
+        printf("Processor %d sending SHARED_DATA for address %lx\n", procNum, addr);
+    }
+    inter_sim->req(SHARED_DATA, addr, procNum, pDest, false, msgNum);
 }
 
 coherence_states
@@ -55,19 +81,21 @@ cacheMI(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
 
 coherence_states
 snoopMI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
-        uint64_t addr, int procNum)
+        uint64_t addr, int procNum, int srcProc, int msgNum)
 {
     *ca = NO_ACTION;
     switch (currentState)
     {
         case INVALID:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return INVALID;
         case MODIFIED:
-            sendData(addr, procNum);
-            // indicateShared(addr, procNum); // Needed for E state
+            sendData(addr, procNum, srcProc, msgNum);
+            // indicateShared(addr, procNum, srcProc, msgNum); // Needed for E state
             *ca = INVALIDATE;
             return INVALID;
         case INVALID_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA || reqType == SHARED)
             {
                 *ca = DATA_RECV;
@@ -78,6 +106,8 @@ snoopMI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
         default:
             fprintf(stderr, "State %d not supported, found on %lx\n",
                     currentState, addr);
+            perror("snoopMI: Unsupported state\n");
+            exit(1);
             break;
     }
 
@@ -152,16 +182,17 @@ cacheMSI(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
 
 coherence_states
 snoopMSI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
-        uint64_t addr, int procNum)
+        uint64_t addr, int procNum, int srcProc, int msgNum)
 {
     *ca = NO_ACTION;
     switch (currentState)
     {
         case INVALID:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return INVALID;
         case MODIFIED:
-            sendData(addr, procNum);
-            // indicateShared(addr, procNum); // Needed for E state
+            sendData(addr, procNum, srcProc, msgNum);
+            // indicateShared(addr, procNum, srcProc, msgNum); // Needed for E state
             if (reqType == BUSRD)
                 return SHARE;
             else if (reqType == BUSWR) {
@@ -170,6 +201,7 @@ snoopMSI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
             }
             return MODIFIED;
         case SHARE:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == BUSWR)
             {
                 *ca = INVALIDATE;
@@ -177,6 +209,7 @@ snoopMSI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
             }
             return SHARE;
         case SHARED_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -184,6 +217,7 @@ snoopMSI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
             }
             return SHARED_MODIFIED;
         case INVALID_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             //maybe need to check for addr
             if (reqType == DATA)
             {
@@ -193,6 +227,7 @@ snoopMSI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
 
             return INVALID_MODIFIED;
         case INVALID_SHARED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -288,49 +323,56 @@ cacheMESI(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
 
 coherence_states
 snoopMESI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
-        uint64_t addr, int procNum)
+        uint64_t addr, int procNum, int srcProc, int msgNum)
 {
     *ca = NO_ACTION;
     switch (currentState)
     {
         case INVALID:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return INVALID;
         case MODIFIED:
             if (reqType == BUSRD) {
-                indicateShared(addr, procNum);
-                sendData(addr, procNum);
+                shareData(addr, procNum, srcProc, msgNum);
                 return SHARE;
             }
             else if (reqType == BUSWR) {
-                sendData(addr, procNum);
+                sendData(addr, procNum, srcProc, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return MODIFIED;
         case EXCLUSIVE:
             if (reqType == BUSRD) { 
-                indicateShared(addr, procNum); 
+                indicateShared(addr, procNum, srcProc, msgNum); 
                 return SHARE;
             } 
             else if (reqType == SHARED) {
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 return SHARE; 
             } 
             else if (reqType == BUSWR) {
                 *ca = INVALIDATE;
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return EXCLUSIVE;
         case SHARE:
             if (reqType == BUSWR)
             {
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
             if (reqType == BUSRD) {
-                indicateShared(addr, procNum);
+                indicateShared(addr, procNum, srcProc, msgNum);
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return SHARE;
         case SHARED_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -338,6 +380,7 @@ snoopMESI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
             }
             return SHARED_MODIFIED;
         case INVALID_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -346,6 +389,7 @@ snoopMESI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
 
             return INVALID_MODIFIED;
         case INVALID_SHARED_EXCLUSIVE:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -457,61 +501,69 @@ cacheMOESI(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
 
 coherence_states
 snoopMOESI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
-        uint64_t addr, int procNum)
+        uint64_t addr, int procNum, int srcProc, int msgNum)
 {
     *ca = NO_ACTION;
     switch (currentState)
     {
         case INVALID:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return INVALID;
         case MODIFIED:
             if (reqType == BUSRD) {
-                indicateShared(addr, procNum);
-                sendData(addr, procNum);
+                shareData(addr, procNum, srcProc, msgNum);
                 return OWNED;
             }
             else if (reqType == BUSWR) {
-                sendData(addr, procNum);
+                sendData(addr, procNum, srcProc, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return MODIFIED;
         case OWNED:
             if (reqType == BUSRD) {
-                indicateShared(addr, procNum);
-                sendData(addr, procNum);
+                shareData(addr, procNum, srcProc, msgNum);
                 return OWNED;
             }
             else if (reqType == BUSWR) {
-                sendData(addr, procNum);
+                sendData(addr, procNum, srcProc, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return OWNED;
         case EXCLUSIVE:
             if (reqType == BUSRD) { 
-                indicateShared(addr, procNum); 
+                indicateShared(addr, procNum, srcProc, msgNum); 
                 return SHARE;
             } 
             else if (reqType == SHARED) {
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 return SHARE; 
             } 
             else if (reqType == BUSWR) {
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return EXCLUSIVE;
         case SHARE:
             if (reqType == BUSWR)
             {
                 *ca = INVALIDATE;
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 return INVALID;
             }
             if (reqType == BUSRD) {
-                indicateShared(addr, procNum);
+                indicateShared(addr, procNum, srcProc, msgNum);
+                return SHARE;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return SHARE;
         case SHARED_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -519,6 +571,7 @@ snoopMOESI(bus_req_type reqType, cache_action* ca, coherence_states currentState
             }
             return SHARED_MODIFIED;
         case INVALID_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -527,6 +580,7 @@ snoopMOESI(bus_req_type reqType, cache_action* ca, coherence_states currentState
 
             return INVALID_MODIFIED;
         case INVALID_SHARED_EXCLUSIVE:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -638,51 +692,56 @@ cacheMESIF(uint8_t is_read, uint8_t* permAvail, coherence_states currentState,
 
 coherence_states
 snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState,
-        uint64_t addr, int procNum)
+        uint64_t addr, int procNum, int srcProc, int msgNum)
 {
     *ca = NO_ACTION;
     switch (currentState)
     {
         case INVALID:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return INVALID;
         case MODIFIED:
             if (reqType == BUSRD) {
-                indicateShared(addr, procNum);
-                sendData(addr, procNum);
+                shareData(addr, procNum, srcProc, msgNum);
                 return SHARE;
             }
             else if (reqType == BUSWR) {
-                sendData(addr, procNum);
+                sendData(addr, procNum, srcProc, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return MODIFIED;
         case FORWARD:
             if (reqType == BUSRD) {
-                indicateShared(addr, procNum);
-                sendData(addr, procNum);
+                shareData(addr, procNum, srcProc, msgNum);
                 return SHARE;
             }
             else if (reqType == BUSWR) {
-                sendData(addr, procNum);
+                sendData(addr, procNum, srcProc, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return FORWARD;
         case EXCLUSIVE:
             if (reqType == BUSRD) { 
-                indicateShared(addr, procNum); 
+                indicateShared(addr, procNum, srcProc, msgNum); 
                 return SHARE;
             } 
             else if (reqType == SHARED) {
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 return SHARE; 
             } 
             else if (reqType == BUSWR) {
+                ack(addr, procNum, srcProc, reqType, msgNum);
                 *ca = INVALIDATE;
                 return INVALID;
             }
+            ack(addr, procNum, srcProc, reqType, msgNum);
             return EXCLUSIVE;
         case SHARE:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == BUSWR)
             {
                 *ca = INVALIDATE;
@@ -690,6 +749,7 @@ snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState
             }
             return SHARE;
         case SHARED_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -697,6 +757,7 @@ snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState
             }
             return SHARED_MODIFIED;
         case INVALID_MODIFIED:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;
@@ -705,6 +766,7 @@ snoopMESIF(bus_req_type reqType, cache_action* ca, coherence_states currentState
 
             return INVALID_MODIFIED;
         case INVALID_SHARED_EXCLUSIVE:
+            ack(addr, procNum, srcProc, reqType, msgNum);
             if (reqType == DATA)
             {
                 *ca = DATA_RECV;

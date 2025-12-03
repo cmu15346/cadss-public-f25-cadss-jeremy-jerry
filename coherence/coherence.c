@@ -15,7 +15,7 @@ coher* self = NULL;
 interconn* inter_sim = NULL;
 cacheCallbackFunc cacheCallback = NULL;
 
-uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum);
+uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum, int srcProc, int msgNum);
 uint8_t permReq(uint8_t is_read, uint64_t addr, int processorNum);
 uint8_t invlReq(uint64_t addr, int processorNum);
 void registerCacheInterface(void (*callback)(int, int, int64_t));
@@ -84,8 +84,12 @@ void setState(uint64_t addr, int processorNum, coherence_states nextState)
     tree_insert(coherStates[processorNum], addr, (void*)nextState);
 }
 
-uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum)
+uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum, int srcProc, int msgNum)
 {
+    if (CADSS_VERBOSE) {
+        printf("Processor %d Bus Req Addr %p via %d\n",
+               processorNum, (void*)addr, reqType);
+    }
     if (processorNum < 0 || processorNum >= processorCount)
     {
         // ERROR
@@ -99,23 +103,23 @@ uint8_t busReq(bus_req_type reqType, uint64_t addr, int processorNum)
     {
         case MI:
             nextState
-                = snoopMI(reqType, &ca, currentState, addr, processorNum);
+                = snoopMI(reqType, &ca, currentState, addr, processorNum, srcProc, msgNum);
             break;
         case MSI:
             nextState
-                = snoopMSI(reqType, &ca, currentState, addr, processorNum);
+                = snoopMSI(reqType, &ca, currentState, addr, processorNum, srcProc, msgNum);
             break;
         case MESI:
             nextState
-                = snoopMESI(reqType, &ca, currentState, addr, processorNum);
+                = snoopMESI(reqType, &ca, currentState, addr, processorNum, srcProc, msgNum);
             break;
         case MOESI:
             nextState
-                = snoopMOESI(reqType, &ca, currentState, addr, processorNum);
+                = snoopMOESI(reqType, &ca, currentState, addr, processorNum, srcProc, msgNum);
             break;
         case MESIF:
             nextState
-                = snoopMESIF(reqType, &ca, currentState, addr, processorNum);
+                = snoopMESIF(reqType, &ca, currentState, addr, processorNum, srcProc, msgNum);
             break;
         default:
             fprintf(stderr, "Undefined coherence scheme - %d\n", cs);
@@ -228,7 +232,7 @@ uint8_t invlReq(uint64_t addr, int processorNum)
             nextState = INVALID;
             if (currentState != INVALID)
             {
-                inter_sim->busReq(DATA, addr, processorNum);
+                //inter_sim->busReq(DATA, addr, processorNum);
                 flush = 1;
             }
             break;
