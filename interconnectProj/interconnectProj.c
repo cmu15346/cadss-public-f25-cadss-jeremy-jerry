@@ -504,21 +504,24 @@ int forwardIfNeeded(bus_req* br, link* lnk) {
         printf("Came from proc %d, going to proc %d\n", cameFrom, goingTo);
         //print link info
         printf("Link between proc %d and proc %d\n", lnk->proc1, lnk->proc2);
+        printInterconnForLineState();
     }
     perProcMsgCount[goingTo] = br->msgNum;
     bus_req* fwdReq = malloc(sizeof(bus_req));
     memcpy(fwdReq, br, sizeof(bus_req));
     fwdReq->procNum = goingTo;
     link* nextLink = NULL;
-    for (int i = 0; i < processorCount; i++) {
-        if (i == processorCount - 1 && br->brt != MEMORY) {
-            break;
-        }
-        link* lnk2 = links[i];
-        if ((goingTo == lnk2->proc1 && cameFrom != lnk2->proc2) ||
-            (goingTo == lnk2->proc2 && cameFrom != lnk2->proc1)) {
-            nextLink = lnk2;
-            break;
+    if (br->pDest != goingTo || br->broadcast) {
+        for (int i = 0; i < processorCount; i++) {
+            if (i == processorCount - 1 && br->brt != MEMORY) {
+                break;
+            }
+            link* lnk2 = links[i];
+            if ((goingTo == lnk2->proc1 && cameFrom != lnk2->proc2) ||
+                (goingTo == lnk2->proc2 && cameFrom != lnk2->proc1)) {
+                nextLink = lnk2;
+                break;
+            }
         }
     }
     if (nextLink != NULL) {
@@ -655,6 +658,13 @@ void lineTick() {
                 int goingTo = forwardIfNeeded(completedReq, lnk);
                 assert(goingTo != completedReq->procNum);
                 assert(goingTo == lnk->proc1 || goingTo == lnk->proc2 || goingTo == -1);
+                if (!(goingTo == completedReq->pDest || goingTo == -1 ||
+                       completedReq->broadcast == true)) {
+                        printf("Req that is causing problems:\n addr: 0x%016lx,\n pSrc: %d,\n pDest: %d,\n msgNum: %d,\n procNum: %d,\n link between %d and %d\n",
+                               completedReq->addr, completedReq->pSrc, completedReq->pDest,
+                               completedReq->msgNum, completedReq->procNum, lnk->proc1, lnk->proc2);
+                        printInterconnForLineState();
+                }
                 assert(goingTo == completedReq->pDest || goingTo == -1 ||
                        completedReq->broadcast == true);
                 if (goingTo != -1 && goingTo < processorCount) {
@@ -823,8 +833,8 @@ void lineTick() {
             lnk->pendingReq->currentState = WAITING_CACHE;
         } 
     }
-    if (tickCount - lastProgressTick > 1000) {
-        printf("No progress made in 1000 ticks, possible deadlock in interconnect\n");
+    if (tickCount - lastProgressTick > 10000) {
+        printf("No progress made in 10000 ticks, possible deadlock in interconnect\n");
         printInterconnForLineState();
         raise(SIGTRAP);
     }
