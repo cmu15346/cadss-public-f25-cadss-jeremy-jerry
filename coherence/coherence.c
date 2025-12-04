@@ -203,11 +203,11 @@ uint8_t permReq(uint8_t is_read, uint64_t addr, int processorNum)
     }
 
     setState(addr, processorNum, nextState);
-    if (CADSS_VERBOSE) {
-        printf("Proc %d Perm Addr %p: %d -> %d via %d\n",
-               processorNum, (void*)addr, currentState, nextState,
-               is_read ? 1 : 0);
-    }
+    // if (CADSS_VERBOSE) {
+    //     printf("Proc %d Perm Addr %p: %d -> %d via %d\n",
+    //            processorNum, (void*)addr, currentState, nextState,
+    //            is_read ? 1 : 0);
+    // }
     return permAvail;
 }
 

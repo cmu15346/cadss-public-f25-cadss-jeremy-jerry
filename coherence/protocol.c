@@ -368,6 +368,7 @@ snoopMESI(bus_req_type reqType, cache_action* ca, coherence_states currentState,
             }
             if (reqType == BUSRD) {
                 indicateShared(addr, procNum, srcProc, msgNum);
+                return SHARE;
             }
             ack(addr, procNum, srcProc, reqType, msgNum);
             return SHARE;
