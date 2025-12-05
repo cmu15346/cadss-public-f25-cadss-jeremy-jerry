@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <memory.h>
 #include <interconnect.h>
-//TODO: interconnect does not send ack, coher will send ack with data/shared if needed
+#include "stree.h"
 
 typedef enum _bus_req_state
 {
@@ -30,6 +30,9 @@ typedef struct _bus_req {
     bool broadcast;     // send to all other processors
     bool ack;           // packet is an ACK packet
     int numAcks;
+    int expectedAcks;
+    int requester; //used for BUSRD/BUSRDX to know who requested the data
+    bool needAck;
 } bus_req;
 
 bus_req* pendingRequest = NULL;
@@ -41,6 +44,49 @@ interconn* self = NULL;
 
 int CADSS_VERBOSE = 0;
 int processorCount = 1;
+
+typedef struct dir_entry {
+    uint64_t addr;
+    uint64_t sharersMask;   // bit p == 1 if proc p is a sharer
+    int owner;              // -1 if no exclusive owner
+    struct dir_entry* next;
+} dir_entry;
+
+static dir_entry* dirHead = NULL;
+
+static tree_t *dirTree = NULL;
+
+static dir_entry* dir_lookup(uint64_t addr, bool create)
+{
+    if (!dirTree) {
+        return NULL; 
+    }
+
+    tkey_t key = (tkey_t)addr;    
+
+    dir_entry *e = (dir_entry *)tree_find(dirTree, key);
+    if (e) {
+        return e;
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    e = calloc(1, sizeof(dir_entry));
+    e->addr        = addr;
+    e->sharersMask = 0;
+    e->owner       = -1;
+
+    bool ok = tree_insert(dirTree, key, e);
+    if (!ok) {
+        free(e);
+        return NULL;
+    }
+
+    return e;
+}
+
 
 static const char* req_state_map[] = {
     [NONE] = "None",
@@ -69,6 +115,8 @@ void printInterconnForLineState(void);
 
 // Topology: 0 = bus, 1 = line, 2 = ring, 3 = mesh, 4 = crossbar
 int8_t t = 0;
+//directory or not
+bool isDir = 1;
 int64_t* perProcMsgCount;
 int64_t globalMsgCount = 0;
 
@@ -100,6 +148,7 @@ link** links;            // array of links in the network (index is link)
  */
 int*** last_msgs;
 
+int messagedMemory = 0;
 int memReqs = 0;
 int memReqsMade = 0;
 int memResponses = 0;
@@ -293,7 +342,10 @@ interconn* init(inter_sim_args* isa)
             // Topology
             case 't':
                 t = atoi(optarg);
-
+                break;
+            case 'd':
+                isDir = true;
+                break;
             default:
                 break;
         }
@@ -321,7 +373,7 @@ interconn* init(inter_sim_args* isa)
         }
         // no live messages yet, so each list is NULL
         perProcMsgCount = calloc(sizeof(int64_t), processorCount);
-        activeRequests = calloc(sizeof(bus_req*), processorCount);
+        activeRequests = calloc(sizeof(bus_req*), processorCount+1);
         globalMsgCount = 0;
     }
 
@@ -335,6 +387,8 @@ interconn* init(inter_sim_args* isa)
 
     memComp = isa->memory;
     memComp->registerInterconnect(self);
+    dirHead = NULL;
+    dirTree = tree_new();
 
     return self;
 }
@@ -434,19 +488,33 @@ void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast
         busReq(brt, addr, procNum);
     }
     else if (t == 1 && processorCount > 1) {
-        //the processor should check the pending requests on its own link(s) and update if this req is related to those
-        // if (CADSS_VERBOSE) {
-        //     printf("Processor %d requesting %s for address %lx via %s to proc %d\n",
-        //            procNum, req_type_map[brt], addr,
-        //            (broadcast) ? "broadcast" : "unicast", pDest);
-        // }
+        //if in dir and is BUSRD or BUSWR, send to memory (procNum == processorCount)
         int numToUse;
+        bool needAck = false;
         if (brt == BUSRD || brt == BUSWR) {
             globalMsgCount++;
             numToUse = globalMsgCount;
+            needAck = true;
         }
         else {
             numToUse = msgNum;
+        }
+        if (isDir == true && (brt == BUSRD || brt == BUSWR)) {
+            messagedMemory++;
+            bus_req* nextReq = calloc(1, sizeof(bus_req));
+            nextReq->brt = brt;
+            nextReq->currentState = QUEUED;
+            nextReq->addr = addr;
+            nextReq->procNum = procNum;
+            nextReq->pSrc = procNum;
+            nextReq->pDest = processorCount;
+            nextReq->msgNum = numToUse;
+            nextReq->requester = procNum;
+            link* lnk = findLink(procNum, processorCount);
+            nextReq->needAck = false;
+            enqLinkRequest(nextReq, lnk);
+            free(nextReq);
+            return;
         }
         bus_req* nextReq = calloc(1, sizeof(bus_req));
         nextReq->brt = brt;
@@ -458,6 +526,8 @@ void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast
         nextReq->pDest = pDest;
         nextReq->broadcast = broadcast;
         nextReq->msgNum = numToUse;
+        nextReq->requester = procNum;
+        nextReq->needAck = needAck;
         if (brt == ACK || brt == DATA || brt == SHARED || brt == SHARED_DATA) {
             //ACKs should not be broadcast
             nextReq->broadcast = false;
@@ -492,6 +562,127 @@ void req(bus_req_type brt, uint64_t addr, int procNum, int pDest, bool broadcast
     }
 }
 
+//for directory based coherence, send BUSWR to a list of processors
+void invalidate(uint64_t addr, int procNum, int* pDests, int numDests) {
+    if (t == 0 || processorCount == 1) {
+        //coher component should not be sending invalidations on bus topology
+        assert(false);
+    }
+    else if (t == 1 && processorCount > 1) {
+        int numToUse;
+        globalMsgCount++;
+        numToUse = globalMsgCount;
+        for (int i = 0; i < numDests; i++) {
+            int pDest = pDests[i];
+            bus_req_type brt = BUSWR;
+            bus_req* nextReq = calloc(1, sizeof(bus_req));
+            nextReq->brt = brt;
+            nextReq->currentState = QUEUED;
+            nextReq->addr = addr;
+            nextReq->procNum = processorCount; //memory is sending
+            nextReq->pSrc = processorCount;
+            nextReq->pDest = pDest;
+            nextReq->msgNum = numToUse;
+            nextReq->expectedAcks = numDests;
+            nextReq->requester = procNum;
+            nextReq->needAck = true;
+            link* lnk = findLink(processorCount, pDest);
+            enqLinkRequest(nextReq, lnk);
+            free(nextReq);
+        }
+    }
+}
+
+void makeOwnerInDirectory(uint64_t addr, int procNum) {
+    assert(isDir == true);
+    dir_entry* e = dir_lookup(addr, true);
+
+    e->owner = procNum;
+    e->sharersMask = (1ULL << procNum);
+}
+
+void addToSharersInDirectory(uint64_t addr, int procNum) {
+    assert(isDir == true);
+    dir_entry* e = dir_lookup(addr, true);
+
+    e->sharersMask |= (1ULL << procNum);
+
+    if (e->owner == -1) {
+        e->owner = procNum;
+    }
+}
+
+int* findProcsToInvalidate(uint64_t addr, int procNum) {
+    assert(isDir == true);
+    dir_entry* e = dir_lookup(addr, false);
+    if (!e || e->sharersMask == 0) {
+        // No sharers; nothing to invalidate.
+        int* res = malloc(sizeof(int));
+        res[0] = -1;
+        return res;
+    }
+
+    // First count how many to invalidate.
+    int count = 0;
+    for (int p = 0; p < processorCount; p++) {
+        if ((e->sharersMask & (1ULL << p)) && p != procNum) {
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        int* res = malloc(sizeof(int));
+        res[0] = -1;
+        return res;
+    }
+
+    // Fill array with processors to invalidate.
+    int* res = malloc(sizeof(int) * (count + 1));
+    int idx = 0;
+    for (int p = 0; p < processorCount; p++) {
+        if ((e->sharersMask & (1ULL << p)) && p != procNum) {
+            res[idx++] = p;
+        }
+    }
+    res[idx] = -1;
+    return res;
+}
+
+//this is called when a memory request reaches memory
+//0 if memory has to wait for invalidates to be acked, 1 if memory can just be notified right away
+int directoryMemoryResponse(bus_req_type brt, uint64_t addr, int procNum) {
+    assert(isDir == true);
+    if (t == 0 || processorCount == 1) {
+        //coher component should not be sending memory requests on bus topology
+        assert(false);
+    }
+    else if (t == 1 && processorCount > 1) {
+        assert(brt == BUSRD || brt == BUSWR);
+        if (brt == BUSWR) {
+            //TODO: find list of processors to invalidate from directory
+            int* toInvalidate = findProcsToInvalidate(addr, procNum);
+            makeOwnerInDirectory(addr, procNum);
+            int numToInvalidate = 0;
+            while (toInvalidate[numToInvalidate] != -1) {
+                numToInvalidate++;
+            }
+            if (numToInvalidate > 0) {
+                invalidate(addr, procNum, toInvalidate, numToInvalidate);
+                free(toInvalidate);
+                return 0;
+            } else {
+                free(toInvalidate);
+                return 1;
+            }
+        }
+        else {
+            //just send to memory
+            addToSharersInDirectory(addr, procNum);
+            return 1; //memory can be notified right away
+        }
+    }
+}
+
 int forwardIfNeeded(bus_req* br, link* lnk) {
     int cameFrom = br->procNum;
     int goingTo;
@@ -518,9 +709,9 @@ int forwardIfNeeded(bus_req* br, link* lnk) {
     link* nextLink = NULL;
     if (br->pDest != goingTo || br->broadcast) {
         for (int i = 0; i < processorCount; i++) {
-            if (i == processorCount - 1 && br->brt != MEMORY) {
-                break;
-            }
+            // if (i == processorCount - 1 && br->brt != MEMORY) {
+            //     break;
+            // }
             link* lnk2 = links[i];
             if ((goingTo == lnk2->proc1 && cameFrom != lnk2->proc2) ||
                 (goingTo == lnk2->proc2 && cameFrom != lnk2->proc1)) {
@@ -563,7 +754,7 @@ void busTick() {
                 // Make a request to memory.
                 countDown
                     = memComp->busReq(pendingRequest->addr,
-                                      pendingRequest->procNum, memReqCallback);
+                                      pendingRequest->requester, memReqCallback);
 
                 pendingRequest->currentState = WAITING_MEMORY;
 
@@ -663,15 +854,6 @@ void lineTick() {
                 int goingTo = forwardIfNeeded(completedReq, lnk);
                 assert(goingTo != completedReq->procNum);
                 assert(goingTo == lnk->proc1 || goingTo == lnk->proc2 || goingTo == -1);
-                if (!(goingTo == completedReq->pDest || goingTo == -1 ||
-                       completedReq->broadcast == true)) {
-                        printf("Req that is causing problems:\n addr: 0x%016lx,\n pSrc: %d,\n pDest: %d,\n msgNum: %d,\n procNum: %d,\n link between %d and %d\n",
-                               completedReq->addr, completedReq->pSrc, completedReq->pDest,
-                               completedReq->msgNum, completedReq->procNum, lnk->proc1, lnk->proc2);
-                        printInterconnForLineState();
-                }
-                assert(goingTo == completedReq->pDest || goingTo == -1 ||
-                       completedReq->broadcast == true);
                 if (goingTo != -1 && goingTo < processorCount) {
                     if (completedReq->pSrc == processorCount) {
                         memRecvs++;
@@ -681,14 +863,24 @@ void lineTick() {
                                       goingTo, completedReq->pSrc, completedReq->msgNum);
                 }
                 else if (goingTo == processorCount) {
-                    assert(completedReq->brt == MEMORY);
+                    assert(completedReq->brt == MEMORY || completedReq->brt == BUSRD || completedReq->brt == BUSWR);
                     assert(completedReq->broadcast == false);
                     assert(completedReq->pDest == processorCount);
-                    assert(completedReq->procNum = processorCount - 1);
+                    assert(completedReq->procNum == processorCount - 1);
                     memReqsMade++;
-                    int memCountDown = memComp->busReq(completedReq->addr,
-                                      completedReq->pSrc, memReqCallback);
-                    lnk->countDown = memCountDown;
+                    int canReplyNow = 1;
+                    if (isDir) {
+                        canReplyNow = directoryMemoryResponse(completedReq->brt,
+                                                             completedReq->addr,
+                                                             completedReq->requester);
+                    }
+                    if (canReplyNow)
+                    {
+                        memReqs++;
+                        int memCountDown = memComp->busReq(completedReq->addr,
+                                        completedReq->requester, memReqCallback);
+                        lnk->countDown = memCountDown;
+                    }
                 }
                 free(completedReq);
 
@@ -696,7 +888,6 @@ void lineTick() {
             else if (lnk->countDown == 0 && lnk->pendingReq->ack == true) {
                 bus_req* completedReq = lnk->pendingReq;
                 lnk->pendingReq = NULL;
-                assert(completedReq->pDest < processorCount); //no acks to memory
                 int goingTo = forwardIfNeeded(completedReq, lnk);
                 assert(goingTo != completedReq->procNum);
                 assert(goingTo == lnk->proc1 || goingTo == lnk->proc2 || goingTo == -1);
@@ -709,29 +900,20 @@ void lineTick() {
                     // }
                     bus_req* prev = NULL;
                     bus_req* iter = activeRequests[completedReq->pDest];
-                    if (iter == NULL) {
-                        printInterconnForLineState();
-                        printf("Req that is causing problems:\n addr: 0x%016lx,\n pSrc: %d,\n pDest: %d,\n msgNum: %d,\n procNum: %d,\n link between %d and %d\n",
-                               completedReq->addr, completedReq->pSrc, completedReq->pDest,
-                               completedReq->msgNum, completedReq->procNum, lnk->proc1, lnk->proc2);
-                    }
-                    assert(iter != NULL);
-                    if (iter->msgNum != completedReq->msgNum) {
+                    if (iter != NULL && iter->msgNum != completedReq->msgNum) {
                         //find in chain
                         prev = iter;
                         iter = iter->next;
-                        assert(iter != NULL);
                         while (iter->msgNum != completedReq->msgNum) {
                             prev = iter;
                             iter = iter->next;
                             if (iter == NULL) {
                                 printInterconnForLineState();
                             }
-                            assert(iter != NULL);
                         }
                     }
-                    if (iter->broadcast) {
-                        //if broadcast, need to wait for acks from all processors
+                    if (iter != NULL && iter->expectedAcks > 0) {
+                        //this message needs acks
                         iter->numAcks++;
                         assert(iter->numAcks <= processorCount - 1);
                         if (completedReq->brt == SHARED_DATA || completedReq->brt == DATA) {
@@ -742,7 +924,7 @@ void lineTick() {
                             //shared data ack, so mark shared as true
                             iter->shared = 1;
                         }
-                        if (iter->numAcks == processorCount - 1) {
+                        if (iter->numAcks == iter->expectedAcks) {
                             //all acks received, remove from active requests
                             // if (CADSS_VERBOSE) {
                             //     printf("All ACKs for broadcast msg %d received at proc %d\n",
@@ -755,37 +937,33 @@ void lineTick() {
                             else {
                                 activeRequests[completedReq->pDest] = iter->next;
                             }
-                            if (!iter->dataAvail) {
+                            if (goingTo == processorCount) {
+                                //memory just got all acks, so can now respond
                                 memReqs++;
-                                req(MEMORY, iter->addr, iter->pSrc, processorCount, false, -2);
+                                link* memLnk = findLink(processorCount - 1, processorCount);
+                                memLnk->countDown = memComp->busReq(iter->addr,
+                                                iter->requester, memReqCallback);
                             }
                             else {
-                                if (iter->shared) {
-                                    //data is shared
-                                    coherComp->busReq(SHARED, iter->addr,
-                                                      iter->pSrc, -1, -2);
+                                //send data to cache
+                                if (!iter->dataAvail) {
+                                    req(MEMORY, iter->addr, iter->pSrc, processorCount, false, -2);
                                 }
                                 else {
-                                    //data is exclusive
-                                    coherComp->busReq(DATA, iter->addr,
-                                                      iter->pSrc, -1, -2);
+                                    if (iter->shared) {
+                                        //data is shared
+                                        coherComp->busReq(SHARED, iter->addr,
+                                                        iter->pSrc, -1, -2);
+                                    }
+                                    else {
+                                        //data is exclusive
+                                        coherComp->busReq(DATA, iter->addr,
+                                                        iter->pSrc, -1, -2);
+                                    }
                                 }
                             }
                             free(iter);
                         }
-                    }
-                    else {
-                        perror("should not be here with no directory\n");
-                        exit(1);
-                        //not broadcast, so just remove from active requests
-                        if (prev != NULL) {
-                            prev->next = iter->next;
-                        }
-                        else {
-                            activeRequests[completedReq->pDest] = iter->next;
-                        }
-                        //TODO: signal completion to processor
-                        free(iter);
                     }
                 }
                 assert(checkActiveRequests());
@@ -800,17 +978,10 @@ void lineTick() {
             bus_req* nextReq = deqLinkRequest(lnk);
             lnk->pendingReq = nextReq;
             if (lnk->pendingReq->procNum == lnk->pendingReq->pSrc &&
-                lnk->pendingReq->ack == false &&
-                (lnk->pendingReq->brt == BUSRD || lnk->pendingReq->brt == BUSWR)) {
-                //print we are waiting for acks for msg with msgnum:
-                // if (CADSS_VERBOSE) {
-                //     printf("Tracking active request from proc %d of type %s for address %lx with msgNum %d\n",
-                //            lnk->pendingReq->pSrc,
-                //            req_type_map[lnk->pendingReq->brt],
-                //            lnk->pendingReq->addr,
-                //            lnk->pendingReq->msgNum);
-                // }
-                assert(lnk->pendingReq->broadcast == true);
+                lnk->pendingReq->needAck) {
+                if (lnk->pendingReq->expectedAcks == 0) {
+                    lnk->pendingReq->expectedAcks = processorCount - 1;
+                }
                 bus_req* copy = malloc(sizeof(bus_req));
                 memcpy(copy, lnk->pendingReq, sizeof(bus_req));
                 copy->numAcks = 0;
@@ -849,10 +1020,10 @@ void lineTick() {
             lnk->pendingReq->currentState = WAITING_CACHE;
         } 
     }
-    // if (tickCount - lastProgressTick > 10000) {
+    // if (tickCount - lastProgressTick > 100000) {
     //     printf("No progress made in 10000 ticks, possible deadlock in interconnect\n");
     //     printInterconnForLineState();
-    //     printf("%d requests to memory, %d requests reached memory, and %d responses from memory, %d of which were received\n", memReqs, memReqsMade, memResponses, memRecvs);
+    //     printf("%d messaged memory, %d requests to memory, %d requests reached memory, and %d responses from memory, %d of which were received\n", messagedMemory, memReqs, memReqsMade, memResponses, memRecvs);
     //     raise(SIGTRAP);
     // }
 }
@@ -906,7 +1077,7 @@ void printInterconnForLineState(void)
         printf("  Link Queue Size: %d\n", linkRequestQueueSize(lnk));
     }
     // Print active requests per processor
-    for (int p = 0; p < processorCount; p++)
+    for (int p = 0; p < processorCount+1; p++)
     {
         printf("  Active Requests for Processor[%02d]:\n", p);
         bus_req* iter = activeRequests[p];
